@@ -195,19 +195,24 @@ def initialize_optimizer(
         )
         return update_param_fn, optimizer_state, key
     elif vmc_config.optimizer_type == "wssr_sketch":
-        return initialize_wssr_sketch(
+        energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(
+            local_energy_fn, vmc_config.nchains, clipping_fn, vmc_config.nan_safe
+        )
+        (
+            update_param_fn,
+            optimizer_state,
+        ) = initialize_wssr_sketch(
             log_psi_apply,
-            local_energy_fn,
-            clipping_fn,
-            vmc_config,
+            energy_and_statistics_fn,
             params,
-            data,
             get_position_fn,
             update_data_fn,
             learning_rate_schedule,
-            key,
+            vmc_config.optimizer.wssr_sketch,
+            vmc_config.record_param_l1_norm,
             apply_pmap=apply_pmap,
         )
+        return update_param_fn, optimizer_state, key
     else:
         raise ValueError(
             "Requested optimizer type not supported; {} was requested".format(

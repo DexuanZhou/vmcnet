@@ -182,6 +182,67 @@ def _zero_history_like(state: WSSRCoreState) -> WSSRCoreState:
     )
 
 
+def _wssr_update_from_svd(
+    o_aug: Array,
+    e_aug: Array,
+    state: WSSRCoreState,
+    u: Array,
+    singular_values: Array,
+    vh: Array,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric,
+    constrain_update_norm: bool,
+    eps: chex.Numeric = 1e-12,
+) -> WSSRSVDResult:
+    """Apply the shared post-SVD WSSR update formula."""
+    if singular_values.shape[0] == 0:
+        zero_state = _zero_history_like(state)
+        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+
+    leading_sv = singular_values[0]
+    if bool(leading_sv <= eps):
+        zero_state = _zero_history_like(state)
+        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+
+    retained = singular_values / leading_sv > damping
+    active_rank = int(jnp.sum(retained))
+    if active_rank == 0:
+        zero_state = _zero_history_like(state)
+        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+
+    u_active = u[:, :active_rank]
+    s_active = singular_values[:active_rank]
+    v_active = vh[:active_rank, :].T
+
+    safe_damping = jnp.maximum(jnp.abs(damping), eps)
+    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(leading_sv))
+    force = o_aug @ e_aug
+    projected_force = u_active.T @ force
+    projected_force = projected_force * (jnp.square(1.0 / s_active) - sigma0)
+    grad_like_update = u_active @ projected_force + sigma0 * force
+
+    if constrain_update_norm:
+        grad_like_update = constrain_norm(grad_like_update, norm_constraint, eps=eps)
+
+    sr_o = jnp.zeros_like(state.sr_o)
+    ek = jnp.zeros_like(state.ek)
+    sr_o = sr_o.at[:, :active_rank].set(u_active * s_active)
+    ek = ek.at[:active_rank].set(v_active.T @ e_aug)
+
+    new_sr_rank = _update_working_rank(
+        active_rank, int(state.sr_rank), sr_rank_max, sr_scale
+    )
+    new_state = WSSRCoreState(
+        sr_o=sr_o,
+        ek=ek,
+        sr_rank0=jnp.array(active_rank),
+        sr_rank=jnp.array(new_sr_rank),
+    )
+    return WSSRSVDResult(grad_like_update, new_state, active_rank)
+
+
 def wssr_svd_core_update(
     o_aug: Array,
     e_aug: Array,
@@ -219,45 +280,112 @@ def wssr_svd_core_update(
     u = u[:, :working_rank]
     vh = vh[:working_rank, :]
 
-    leading_sv = singular_values[0]
-    if bool(leading_sv <= eps):
+    return _wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale,
+        constrain_update_norm,
+        eps=eps,
+    )
+
+
+def randomized_svd(
+    o_aug: Array,
+    target_rank: int,
+    sketch_oversampling: int,
+    sketch_n_iter: int,
+    key: Array,
+) -> Tuple[Array, Array, Array]:
+    """Compute a randomized low-rank SVD approximation of ``o_aug``."""
+    if target_rank < 0:
+        raise ValueError("target_rank must be nonnegative")
+    if sketch_oversampling < 0:
+        raise ValueError("sketch_oversampling must be nonnegative")
+    if sketch_n_iter < 0:
+        raise ValueError("sketch_n_iter must be nonnegative")
+
+    clipped_rank = min(target_rank, o_aug.shape[0], o_aug.shape[1])
+    if clipped_rank == 0:
+        return (
+            jnp.zeros((o_aug.shape[0], 0), dtype=o_aug.dtype),
+            jnp.zeros((0,), dtype=o_aug.dtype),
+            jnp.zeros((0, o_aug.shape[1]), dtype=o_aug.dtype),
+        )
+
+    sketch_rank = min(
+        clipped_rank + sketch_oversampling,
+        o_aug.shape[0],
+        o_aug.shape[1],
+    )
+    omega = jax.random.normal(key, (o_aug.shape[1], sketch_rank), dtype=o_aug.dtype)
+    y = o_aug @ omega
+    for _ in range(sketch_n_iter):
+        y = o_aug @ (o_aug.T @ y)
+
+    q, _ = jnp.linalg.qr(y, mode="reduced")
+    b = q.T @ o_aug
+    u_hat, singular_values, vh = jnp.linalg.svd(b, full_matrices=False)
+    u = q @ u_hat
+    return (
+        u[:, :clipped_rank],
+        singular_values[:clipped_rank],
+        vh[:clipped_rank, :],
+    )
+
+
+def wssr_sketch_core_update(
+    o_aug: Array,
+    e_aug: Array,
+    state: WSSRCoreState,
+    key: Array,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    sketch_oversampling: int = 5,
+    sketch_n_iter: int = 1,
+    constrain_update_norm: bool = True,
+    eps: chex.Numeric = 1e-12,
+) -> WSSRSVDResult:
+    """Compute one randomized-SVD WSSR core update."""
+    sr_rank = int(state.sr_rank)
+    if sr_rank == 0 or sr_rank_max == 0:
         zero_state = _zero_history_like(state)
         return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
 
-    retained = singular_values / leading_sv > damping
-    active_rank = int(jnp.sum(retained))
-    if active_rank == 0:
+    working_rank = min(sr_rank, o_aug.shape[0], o_aug.shape[1])
+    if working_rank == 0:
         zero_state = _zero_history_like(state)
         return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
 
-    u_active = u[:, :active_rank]
-    s_active = singular_values[:active_rank]
-    v_active = vh[:active_rank, :].T
-
-    sigma0 = 1.0 / jnp.square(damping * jnp.abs(leading_sv))
-    force = o_aug @ e_aug
-    projected_force = u_active.T @ force
-    projected_force = projected_force * (jnp.square(1.0 / s_active) - sigma0)
-    grad_like_update = u_active @ projected_force + sigma0 * force
-
-    if constrain_update_norm:
-        grad_like_update = constrain_norm(grad_like_update, norm_constraint, eps=eps)
-
-    sr_o = jnp.zeros_like(state.sr_o)
-    ek = jnp.zeros_like(state.ek)
-    sr_o = sr_o.at[:, :active_rank].set(u_active * s_active)
-    ek = ek.at[:active_rank].set(v_active.T @ e_aug)
-
-    new_sr_rank = _update_working_rank(
-        active_rank, sr_rank, sr_rank_max, sr_scale
+    u, singular_values, vh = randomized_svd(
+        o_aug,
+        working_rank,
+        sketch_oversampling,
+        sketch_n_iter,
+        key,
     )
-    new_state = WSSRCoreState(
-        sr_o=sr_o,
-        ek=ek,
-        sr_rank0=jnp.array(active_rank),
-        sr_rank=jnp.array(new_sr_rank),
+    return _wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale,
+        constrain_update_norm,
+        eps=eps,
     )
-    return WSSRSVDResult(grad_like_update, new_state, active_rank)
 
 
 def compute_wssr_svd_core_update(
@@ -288,6 +416,45 @@ def compute_wssr_svd_core_update(
         norm_constraint,
         sr_rank_max,
         sr_scale=sr_scale,
+        constrain_update_norm=constrain_update_norm,
+    )
+    return unravel_fn(result.grad_like_update), result.state, result.active_rank
+
+
+def compute_wssr_sketch_core_update(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    local_energies: Array,
+    energy: Array,
+    state: WSSRCoreState,
+    key: Array,
+    eta: chex.Numeric,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    sketch_oversampling: int = 5,
+    sketch_n_iter: int = 1,
+    constrain_update_norm: bool = True,
+) -> Tuple[P, WSSRCoreState, int]:
+    """Compute a randomized-SVD WSSR core update and unflatten it."""
+    o_cur, unravel_fn = center_and_scale_score_matrix(
+        log_psi_apply, params, positions
+    )
+    e_cur = center_and_scale_energy_residuals(local_energies, energy)
+    o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
+    result = wssr_sketch_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale=sr_scale,
+        sketch_oversampling=sketch_oversampling,
+        sketch_n_iter=sketch_n_iter,
         constrain_update_norm=constrain_update_norm,
     )
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
@@ -363,6 +530,70 @@ def construct_wssr_svd_update_param_fn(
     return update_param_fn
 
 
+def construct_wssr_sketch_update_param_fn(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    optimizer: optax.GradientTransformation,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+) -> UpdateParamFn[P, D, WSSROptimizerState]:
+    """Create the integrated randomized-SVD WSSR update function."""
+
+    def update_param_fn(params, data, optimizer_state, key):
+        position = get_position_fn(data)
+        energy, local_energies, stats = energy_and_statistics_fn(params, position)
+        key, sketch_key = jax.random.split(key)
+
+        grad_like_update, core_state, _ = compute_wssr_sketch_core_update(
+            log_psi_apply,
+            params,
+            position,
+            local_energies,
+            energy,
+            optimizer_state.core_state,
+            sketch_key,
+            optimizer_config.eta,
+            optimizer_config.damping,
+            optimizer_config.norm_constraint,
+            optimizer_config.sr_rank_max,
+            sr_scale=optimizer_config.sr_scale,
+            sketch_oversampling=optimizer_config.sketch_oversampling,
+            sketch_n_iter=optimizer_config.sketch_n_iter,
+            constrain_update_norm=False,
+        )
+
+        updates, optax_state = optimizer.update(
+            grad_like_update, optimizer_state.optax_state, params
+        )
+        if optimizer_config.constrain_norm:
+            updates = constrain_update_tree_norm(
+                updates, optimizer_config.norm_constraint
+            )
+        params = optax.apply_updates(params, updates)
+        data = update_data_fn(data, params)
+
+        metrics = {"energy": energy, "variance": stats["variance"]}
+        metrics = update_metrics_with_noclip(
+            stats["energy_noclip"],
+            stats["variance_noclip"],
+            metrics,
+        )
+        if record_param_l1_norm:
+            metrics.update({"param_l1_norm": tree_reduce_l1(params)})
+
+        return (
+            params,
+            data,
+            WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+            metrics,
+            key,
+        )
+
+    return update_param_fn
+
+
 def initialize_wssr_svd(
     log_psi_apply: ModelApply[P],
     energy_and_statistics_fn,
@@ -404,6 +635,42 @@ def initialize_wssr_svd(
     )
 
 
-def initialize_wssr_sketch(*args, **kwargs):
-    """Placeholder initializer for the future sketched WSSR optimizer."""
-    raise NotImplementedError("wssr_sketch is not implemented yet")
+def initialize_wssr_sketch(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    params: P,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    learning_rate_schedule: LearningRateSchedule,
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+    apply_pmap: bool = True,
+) -> Tuple[UpdateParamFn[P, D, WSSROptimizerState], WSSROptimizerState]:
+    """Get an update function and initial state for randomized-SVD WSSR."""
+    if apply_pmap:
+        raise NotImplementedError("wssr_sketch currently supports apply_pmap=False only")
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    core_state = initialize_wssr_core_state(
+        flat_params.shape[0],
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        dtype=flat_params.dtype,
+    )
+    optimizer = optax.sgd(
+        learning_rate=learning_rate_schedule, momentum=0, nesterov=False
+    )
+    optax_state = optimizer.init(params)
+    update_param_fn = construct_wssr_sketch_update_param_fn(
+        log_psi_apply,
+        energy_and_statistics_fn,
+        optimizer,
+        get_position_fn,
+        update_data_fn,
+        optimizer_config,
+        record_param_l1_norm=record_param_l1_norm,
+    )
+    return (
+        update_param_fn,
+        WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+    )

@@ -47,6 +47,13 @@ def _assert_tree_all_finite(tree):
         assert jnp.all(jnp.isfinite(leaf))
 
 
+def _assert_wssr_state_all_finite(state):
+    assert jnp.all(jnp.isfinite(state.sr_o))
+    assert jnp.all(jnp.isfinite(state.ek))
+    assert jnp.all(jnp.isfinite(state.sr_rank0))
+    assert jnp.all(jnp.isfinite(state.sr_rank))
+
+
 def test_initialize_wssr_core_state_shapes_and_ranks():
     state = wssr.initialize_wssr_core_state(
         num_params=5, sr_rank=3, sr_rank_max=7, dtype=jnp.float32
@@ -75,6 +82,8 @@ def test_default_config_contains_wssr_sketch_placeholder():
     assert config.vmc.optimizer.wssr_sketch.learning_rate == 5e-2
     assert config.vmc.optimizer.wssr_sketch.sr_rank == 10
     assert config.vmc.optimizer.wssr_sketch.sr_rank_max == 100
+    assert config.vmc.optimizer.wssr_sketch.sketch_oversampling == 5
+    assert config.vmc.optimizer.wssr_sketch.sketch_n_iter == 1
 
 
 def test_center_and_scale_score_matrix_uses_julia_convention():
@@ -477,16 +486,147 @@ def test_initialize_wssr_svd_rejects_pmap_until_jit_safe_core_exists():
         raise AssertionError("Expected wssr_svd to reject apply_pmap=True")
 
 
-def test_initialize_wssr_sketch_placeholder_raises_clear_error():
-    try:
-        wssr.initialize_wssr_sketch()
-    except NotImplementedError as err:
-        assert str(err) == "wssr_sketch is not implemented yet"
-    else:
-        raise AssertionError("Expected wssr_sketch placeholder to raise")
+def test_randomized_svd_clips_rank_for_tiny_matrices():
+    o_aug = jnp.arange(6.0).reshape(2, 3)
+
+    u, singular_values, vh = wssr.randomized_svd(
+        o_aug,
+        target_rank=10,
+        sketch_oversampling=5,
+        sketch_n_iter=1,
+        key=jax.random.PRNGKey(0),
+    )
+
+    assert u.shape == (2, 2)
+    assert singular_values.shape == (2,)
+    assert vh.shape == (2, 3)
+    assert jnp.all(jnp.isfinite(singular_values))
 
 
-def test_initialize_optimizer_dispatches_wssr_sketch_placeholder():
+def test_wssr_sketch_core_update_is_deterministic_with_fixed_key():
+    state = wssr.initialize_wssr_core_state(
+        num_params=3, sr_rank=2, sr_rank_max=4, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, -1.0],
+            [1.0, 1.0, 0.5],
+        ]
+    )
+    e_aug = jnp.array([0.25, -0.5, 0.75])
+    key = jax.random.PRNGKey(3)
+
+    result_1 = wssr.wssr_sketch_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sketch_oversampling=2,
+        sketch_n_iter=1,
+        constrain_update_norm=False,
+    )
+    result_2 = wssr.wssr_sketch_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sketch_oversampling=2,
+        sketch_n_iter=1,
+        constrain_update_norm=False,
+    )
+
+    np.testing.assert_allclose(result_1.grad_like_update, result_2.grad_like_update)
+    np.testing.assert_allclose(result_1.state.sr_o, result_2.state.sr_o)
+    np.testing.assert_allclose(result_1.state.ek, result_2.state.ek)
+    assert result_1.active_rank == result_2.active_rank
+
+
+def test_initialize_optimizer_dispatches_wssr_sketch_and_constructs_state():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_sketch"
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(0),
+        apply_pmap=False,
+    )
+
+    assert callable(update_param_fn)
+    assert isinstance(optimizer_state, wssr.WSSROptimizerState)
+    assert optimizer_state.core_state.sr_o.shape[0] == 3
+    assert optimizer_state.core_state.ek.shape == (
+        config.vmc.optimizer.wssr_sketch.sr_rank_max,
+    )
+    assert 0 <= optimizer_state.core_state.sr_rank0 <= optimizer_state.core_state.sr_rank
+    assert key.shape == (2,)
+
+
+def test_wssr_sketch_integrated_update_preserves_structure_and_has_no_nans():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_sketch"
+    config.vmc.optimizer.wssr_sketch.schedule_type = "constant"
+    config.vmc.optimizer.wssr_sketch.learning_rate = 0.125
+    config.vmc.optimizer.wssr_sketch.constrain_norm = False
+    config.vmc.optimizer.wssr_sketch.sketch_oversampling = 2
+    config.vmc.optimizer.wssr_sketch.sketch_n_iter = 1
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(4),
+        apply_pmap=False,
+    )
+
+    new_params, new_data, new_optimizer_state, metrics, new_key = update_param_fn(
+        params, data, optimizer_state, key
+    )
+
+    assert jax.tree_util.tree_structure(new_params) == jax.tree_util.tree_structure(
+        params
+    )
+    _assert_tree_all_finite(new_params)
+    _assert_wssr_state_all_finite(new_optimizer_state.core_state)
+    assert isinstance(new_optimizer_state, wssr.WSSROptimizerState)
+    assert (
+        0
+        <= new_optimizer_state.core_state.sr_rank0
+        <= new_optimizer_state.core_state.sr_rank
+        <= config.vmc.optimizer.wssr_sketch.sr_rank_max
+    )
+    assert set(metrics).issuperset({"energy", "variance", "energy_noclip"})
+    assert jnp.all(jnp.isfinite(jnp.asarray(list(metrics.values()))))
+    np.testing.assert_allclose(new_data, data)
+    assert new_key.shape == key.shape
+    assert not np.allclose(new_key, key)
+
+
+def test_initialize_wssr_sketch_rejects_pmap_until_jit_safe_core_exists():
     params = _tiny_params()
     data = _tiny_positions()
     config = default_config.get_default_config()
@@ -504,9 +644,9 @@ def test_initialize_optimizer_dispatches_wssr_sketch_placeholder():
             lambda x: x,
             lambda d, p: d,
             jax.random.PRNGKey(0),
-            apply_pmap=False,
+            apply_pmap=True,
         )
     except NotImplementedError as err:
-        assert str(err) == "wssr_sketch is not implemented yet"
+        assert "apply_pmap=False" in str(err)
     else:
-        raise AssertionError("Expected wssr_sketch dispatch to reach placeholder")
+        raise AssertionError("Expected wssr_sketch to reject apply_pmap=True")
