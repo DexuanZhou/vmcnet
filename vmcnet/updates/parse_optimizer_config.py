@@ -25,7 +25,7 @@ from .optax_utils import (
 from .spring import initialize_spring
 from .kfac import initialize_kfac
 from .gauss_newton import initialize_gauss_newton
-from .wssr import initialize_wssr_svd
+from .wssr import initialize_wssr_sketch, initialize_wssr_svd
 
 
 def _get_learning_rate_schedule(
@@ -194,6 +194,20 @@ def initialize_optimizer(
             apply_pmap=apply_pmap,
         )
         return update_param_fn, optimizer_state, key
+    elif vmc_config.optimizer_type == "wssr_sketch":
+        return initialize_wssr_sketch(
+            log_psi_apply,
+            local_energy_fn,
+            clipping_fn,
+            vmc_config,
+            params,
+            data,
+            get_position_fn,
+            update_data_fn,
+            learning_rate_schedule,
+            key,
+            apply_pmap=apply_pmap,
+        )
     else:
         raise ValueError(
             "Requested optimizer type not supported; {} was requested".format(

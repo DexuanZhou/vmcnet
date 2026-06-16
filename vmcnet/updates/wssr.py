@@ -402,3 +402,8 @@ def initialize_wssr_svd(
         update_param_fn,
         WSSROptimizerState(core_state=core_state, optax_state=optax_state),
     )
+
+
+def initialize_wssr_sketch(*args, **kwargs):
+    """Placeholder initializer for the future sketched WSSR optimizer."""
+    raise NotImplementedError("wssr_sketch is not implemented yet")

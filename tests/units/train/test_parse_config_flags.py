@@ -68,6 +68,21 @@ def test_parse_config_with_valid_flags_including_tuple(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_accepts_wssr_sketch_optimizer_type(mocker):
+    """Test that wssr_sketch is accepted as a visible optimizer option."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        ["vmcnet", "--config.vmc.optimizer_type=wssr_sketch"],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_sketch"
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_setting_duplicated_config_flag_sets_only_desired_flag(mocker):
     """Test changing normal_init.type only affects the desired instance of the flag.
 

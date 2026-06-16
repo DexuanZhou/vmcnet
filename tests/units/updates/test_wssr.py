@@ -69,6 +69,14 @@ def test_default_config_contains_wssr_svd_without_changing_default_optimizer():
     assert "damping_min" not in config.vmc.optimizer.wssr_svd
 
 
+def test_default_config_contains_wssr_sketch_placeholder():
+    config = default_config.get_default_config()
+
+    assert config.vmc.optimizer.wssr_sketch.learning_rate == 5e-2
+    assert config.vmc.optimizer.wssr_sketch.sr_rank == 10
+    assert config.vmc.optimizer.wssr_sketch.sr_rank_max == 100
+
+
 def test_center_and_scale_score_matrix_uses_julia_convention():
     params = _tiny_params()
     positions = _tiny_positions()
@@ -467,3 +475,38 @@ def test_initialize_wssr_svd_rejects_pmap_until_jit_safe_core_exists():
         assert "apply_pmap=False" in str(err)
     else:
         raise AssertionError("Expected wssr_svd to reject apply_pmap=True")
+
+
+def test_initialize_wssr_sketch_placeholder_raises_clear_error():
+    try:
+        wssr.initialize_wssr_sketch()
+    except NotImplementedError as err:
+        assert str(err) == "wssr_sketch is not implemented yet"
+    else:
+        raise AssertionError("Expected wssr_sketch placeholder to raise")
+
+
+def test_initialize_optimizer_dispatches_wssr_sketch_placeholder():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_sketch"
+
+    try:
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=False,
+        )
+    except NotImplementedError as err:
+        assert str(err) == "wssr_sketch is not implemented yet"
+    else:
+        raise AssertionError("Expected wssr_sketch dispatch to reach placeholder")
