@@ -61,7 +61,6 @@ class RepeatedDenseBlock(kfac_jax.DenseTwoKroneckerFactored):
         ema_old: chex.Numeric,
         ema_new: chex.Numeric,
         batch_size: int,
-        pmap_axis_name: Optional[str],
     ) -> kfac_jax.TwoKroneckerFactored.State:
         estimation_data = dict(**estimation_data)
         (x,) = estimation_data["inputs"]
@@ -71,7 +70,7 @@ class RepeatedDenseBlock(kfac_jax.DenseTwoKroneckerFactored):
         estimation_data["outputs_tangent"] = (dy.reshape([-1, dy.shape[-1]]),)
         batch_size = x.size // x.shape[-1]
         return super().update_curvature_matrix_estimate(
-            state, estimation_data, ema_old, ema_new, batch_size, pmap_axis_name
+            state, estimation_data, ema_old, ema_new, batch_size
         )
 
 
@@ -94,7 +93,6 @@ class QmcBlockedDense(kfac_jax.TwoKroneckerFactored):
         ema_old: chex.Numeric,
         ema_new: chex.Numeric,
         batch_size: int,
-        pmap_axis_name: Optional[str],
     ) -> kfac_jax.TwoKroneckerFactored.State:
         (x,) = estimation_data["inputs"]
         (dy,) = estimation_data["outputs_tangent"]
@@ -145,9 +143,9 @@ class QmcBlockedDense(kfac_jax.TwoKroneckerFactored):
         exact_powers: chex.Numeric,
         approx_powers: chex.Numeric,
         eigenvalues: bool,
-        pmap_axis_name: Optional[str],
     ) -> kfac_jax.TwoKroneckerFactored.State:
         del eigenvalues
+        pmap_axis_name = None
         state.inputs_factor.sync(pmap_axis_name)
         state.outputs_factor.sync(pmap_axis_name)
         if exact_powers:
