@@ -400,6 +400,66 @@ def randomized_svd(
     )
 
 
+def fixed_shape_randomized_svd(
+    o_aug: Array,
+    state: WSSRCoreState,
+    key: Array,
+    sr_rank_max: int,
+    sketch_oversampling: int,
+    sketch_n_iter: int,
+) -> Tuple[Array, Array, Array]:
+    """Compute a fixed-shape randomized SVD approximation for JIT-safe WSSR."""
+    if sketch_oversampling < 0:
+        raise ValueError("sketch_oversampling must be nonnegative")
+    if sketch_n_iter < 0:
+        raise ValueError("sketch_n_iter must be nonnegative")
+
+    rank_capacity = min(state.sr_o.shape[1], sr_rank_max, o_aug.shape[0], o_aug.shape[1])
+    if rank_capacity == 0:
+        return (
+            jnp.zeros((o_aug.shape[0], 0), dtype=o_aug.dtype),
+            jnp.zeros((0,), dtype=o_aug.dtype),
+            jnp.zeros((0, o_aug.shape[1]), dtype=o_aug.dtype),
+        )
+
+    sketch_capacity = min(
+        rank_capacity + sketch_oversampling,
+        o_aug.shape[0],
+        o_aug.shape[1],
+    )
+    rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_capacity, dtype=state.sr_rank.dtype),
+    )
+    sketch_rank = jnp.minimum(
+        rank + jnp.asarray(sketch_oversampling, dtype=state.sr_rank.dtype),
+        jnp.asarray(sketch_capacity, dtype=state.sr_rank.dtype),
+    )
+    rank_mask = (jnp.arange(rank_capacity) < rank).astype(o_aug.dtype)
+    sketch_mask = (jnp.arange(sketch_capacity) < sketch_rank).astype(o_aug.dtype)
+
+    omega = jax.random.normal(
+        key, (o_aug.shape[1], sketch_capacity), dtype=o_aug.dtype
+    )
+    omega = omega * sketch_mask
+    y = o_aug @ omega
+    y = y * sketch_mask
+    for _ in range(sketch_n_iter):
+        y = o_aug @ (o_aug.T @ y)
+        y = y * sketch_mask
+
+    q, _ = jnp.linalg.qr(y, mode="reduced")
+    q = q * sketch_mask
+    b = q.T @ o_aug
+    u_hat, singular_values, vh = jnp.linalg.svd(b, full_matrices=False)
+    u = q @ u_hat
+    return (
+        u[:, :rank_capacity] * rank_mask,
+        singular_values[:rank_capacity] * rank_mask,
+        vh[:rank_capacity, :] * rank_mask[:, None],
+    )
+
+
 def wssr_sketch_core_update(
     o_aug: Array,
     e_aug: Array,
@@ -415,22 +475,21 @@ def wssr_sketch_core_update(
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Compute one randomized-SVD WSSR core update."""
-    sr_rank = int(state.sr_rank)
-    if sr_rank == 0 or sr_rank_max == 0:
+    if sr_rank_max == 0:
         zero_state = _zero_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+        return WSSRSVDResult(
+            jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype),
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
 
-    working_rank = min(sr_rank, o_aug.shape[0], o_aug.shape[1])
-    if working_rank == 0:
-        zero_state = _zero_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
-
-    u, singular_values, vh = randomized_svd(
+    u, singular_values, vh = fixed_shape_randomized_svd(
         o_aug,
-        working_rank,
+        state,
+        key,
+        sr_rank_max,
         sketch_oversampling,
         sketch_n_iter,
-        key,
     )
     return _wssr_update_from_svd(
         o_aug,
@@ -446,6 +505,17 @@ def wssr_sketch_core_update(
         constrain_update_norm,
         eps=eps,
     )
+
+
+_jitted_wssr_sketch_core_update = jax.jit(
+    wssr_sketch_core_update,
+    static_argnames=(
+        "sr_rank_max",
+        "sketch_oversampling",
+        "sketch_n_iter",
+        "constrain_update_norm",
+    ),
+)
 
 
 def warm_start_svd(
@@ -638,7 +708,7 @@ def compute_wssr_sketch_core_update(
     )
     e_cur = center_and_scale_energy_residuals(local_energies, energy)
     o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
-    result = wssr_sketch_core_update(
+    result = _jitted_wssr_sketch_core_update(
         o_aug,
         e_aug,
         state,
@@ -824,7 +894,7 @@ def construct_wssr_sketch_update_param_fn(
             key,
         )
 
-    return update_param_fn
+    return jax.jit(update_param_fn)
 
 
 def construct_wssr_warm_svd_update_param_fn(

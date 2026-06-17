@@ -681,6 +681,161 @@ def test_wssr_sketch_core_update_is_deterministic_with_fixed_key():
     assert result_1.active_rank == result_2.active_rank
 
 
+def test_fixed_shape_randomized_svd_masks_inactive_rank_columns():
+    state = wssr.initialize_wssr_core_state(
+        num_params=4, sr_rank=2, sr_rank_max=4, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [4.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [1.0, -1.0, 0.5, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    u, singular_values, vh = wssr.fixed_shape_randomized_svd(
+        o_aug,
+        state,
+        key=jax.random.PRNGKey(17),
+        sr_rank_max=4,
+        sketch_oversampling=2,
+        sketch_n_iter=0,
+    )
+
+    assert u.shape == (4, 4)
+    assert singular_values.shape == (4,)
+    assert vh.shape == (4, 4)
+    assert jnp.all(jnp.isfinite(u))
+    assert jnp.all(jnp.isfinite(singular_values))
+    assert jnp.all(jnp.isfinite(vh))
+    np.testing.assert_allclose(u[:, 2:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(singular_values[2:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(vh[2:, :], 0.0, atol=1e-6)
+
+
+def test_wssr_sketch_core_jitted_matches_eager_update_and_history():
+    state = wssr.WSSRCoreState(
+        sr_o=jnp.array(
+            [
+                [0.2, -0.1, 0.0, 0.0],
+                [0.4, 0.3, 0.0, 0.0],
+                [-0.5, 0.25, 0.0, 0.0],
+                [0.1, -0.2, 0.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        ek=jnp.array([0.5, -0.25, 0.0, 0.0], dtype=jnp.float32),
+        sr_rank0=jnp.array(2),
+        sr_rank=jnp.array(2),
+    )
+    o_aug = jnp.array(
+        [
+            [2.0, 0.5, -1.0, 0.25],
+            [0.0, 1.5, 0.5, -0.75],
+            [1.0, -0.25, 1.25, 0.5],
+            [0.25, 1.0, -0.5, 1.5],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75], dtype=jnp.float32)
+    key = jax.random.PRNGKey(123)
+    kwargs = dict(
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=1.5,
+        sketch_oversampling=2,
+        sketch_n_iter=1,
+        constrain_update_norm=False,
+    )
+
+    eager = wssr.wssr_sketch_core_update(o_aug, e_aug, state, key=key, **kwargs)
+    jitted_update = jax.jit(
+        wssr.wssr_sketch_core_update,
+        static_argnames=(
+            "sr_rank_max",
+            "sketch_oversampling",
+            "sketch_n_iter",
+            "constrain_update_norm",
+        ),
+    )
+    jitted = jitted_update(o_aug, e_aug, state, key=key, **kwargs)
+    jitted.grad_like_update.block_until_ready()
+
+    chex.assert_trees_all_close(
+        eager.grad_like_update, jitted.grad_like_update, rtol=1e-5, atol=1e-5
+    )
+    chex.assert_trees_all_close(eager.state.sr_o, jitted.state.sr_o)
+    chex.assert_trees_all_close(eager.state.ek, jitted.state.ek)
+    chex.assert_trees_all_close(eager.state.sr_rank0, jitted.state.sr_rank0)
+    chex.assert_trees_all_close(eager.state.sr_rank, jitted.state.sr_rank)
+    chex.assert_trees_all_close(eager.active_rank, jitted.active_rank)
+
+
+def test_wssr_sketch_core_jits_and_preserves_rank_growth_history():
+    state = wssr.initialize_wssr_core_state(
+        num_params=4, sr_rank=2, sr_rank_max=4, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [4.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75], dtype=jnp.float32)
+    jitted_update = jax.jit(
+        wssr.wssr_sketch_core_update,
+        static_argnames=(
+            "sr_rank_max",
+            "sketch_oversampling",
+            "sketch_n_iter",
+            "constrain_update_norm",
+        ),
+    )
+
+    first = jitted_update(
+        o_aug,
+        e_aug,
+        state,
+        key=jax.random.PRNGKey(5),
+        damping=1e-4,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=2.0,
+        sketch_oversampling=2,
+        sketch_n_iter=0,
+        constrain_update_norm=False,
+    )
+    first.grad_like_update.block_until_ready()
+    second = jitted_update(
+        o_aug,
+        e_aug,
+        first.state,
+        key=jax.random.PRNGKey(6),
+        damping=1e-4,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=2.0,
+        sketch_oversampling=2,
+        sketch_n_iter=0,
+        constrain_update_norm=False,
+    )
+    second.grad_like_update.block_until_ready()
+
+    _assert_wssr_state_all_finite(first.state)
+    _assert_wssr_state_all_finite(second.state)
+    assert first.state.sr_rank0 == 2
+    assert first.state.sr_rank == 4
+    assert 0 <= second.state.sr_rank0 <= second.state.sr_rank <= 4
+    assert jnp.any(first.state.sr_o[:, :2] != 0.0)
+    assert jnp.all(first.state.sr_o[:, 2:] == 0.0)
+
+
 def test_initialize_optimizer_dispatches_wssr_sketch_and_constructs_state():
     params = _tiny_params()
     data = _tiny_positions()
