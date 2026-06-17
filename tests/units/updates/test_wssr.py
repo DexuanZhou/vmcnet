@@ -122,6 +122,7 @@ def test_default_config_contains_wssr_warm_svd():
     assert config.vmc.optimizer.wssr_warm_svd.sr_rank_max == 100
     assert config.vmc.optimizer.wssr_warm_svd.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd.svd_maxiter_warm == 2
+    assert config.vmc.optimizer.wssr_warm_svd.svd_working_rank == -1
 
 
 def test_center_and_scale_score_matrix_uses_julia_convention():
@@ -1022,6 +1023,128 @@ def test_wssr_warm_svd_first_and_second_updates_store_and_reuse_u():
     assert jnp.any(second.state.u[:, :2] != 0.0)
 
 
+def test_wssr_warm_svd_working_rank_keeps_fixed_state_shape_and_masks_tail():
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=5, sr_rank=4, sr_rank_max=6, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [3.0, 0.5, -1.0, 0.0, 1.0, -0.5, 0.25, 0.75],
+            [0.0, 2.5, 0.5, -1.5, 0.0, 1.0, -0.25, 0.5],
+            [1.0, -0.25, 2.0, 0.75, -1.0, 0.0, 0.5, -0.5],
+            [0.5, 1.0, -0.75, 1.5, 0.25, -1.0, 0.0, 0.25],
+            [-1.0, 0.25, 0.5, -0.5, 2.0, 0.75, -0.75, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.6, -0.4, 0.2, -0.1])
+
+    result = wssr.wssr_warm_svd_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key=jax.random.PRNGKey(17),
+        damping=1e-5,
+        norm_constraint=10.0,
+        sr_rank_max=6,
+        sr_scale=2.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+    )
+
+    assert result.state.sr_o.shape == (5, 6)
+    assert result.state.ek.shape == (6,)
+    assert result.state.u.shape == (5, 6)
+    assert result.state.sr_rank0 <= 3
+    assert result.state.sr_rank <= 3
+    np.testing.assert_allclose(result.state.sr_o[:, 3:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(result.state.ek[3:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(result.state.u[:, 3:], 0.0, atol=1e-6)
+    _assert_wssr_state_all_finite(result.state)
+
+
+def test_wssr_warm_svd_working_rank_caps_stale_rank_growth():
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4, sr_rank=6, sr_rank_max=6, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [4.0, 0.0, 0.0, 0.5, -1.0, 0.25],
+            [0.0, 3.0, 0.0, -0.25, 0.5, -0.75],
+            [0.0, 0.0, 2.0, 1.0, 0.25, 0.5],
+            [1.0, -1.0, 0.5, 0.0, 2.0, -0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.4, -0.2])
+
+    result = wssr.wssr_warm_svd_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key=jax.random.PRNGKey(19),
+        damping=1e-5,
+        norm_constraint=10.0,
+        sr_rank_max=6,
+        sr_scale=2.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=2,
+        constrain_update_norm=False,
+    )
+
+    assert result.state.sr_rank0 <= 2
+    assert result.state.sr_rank <= 2
+    np.testing.assert_allclose(result.state.sr_o[:, 2:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(result.state.ek[2:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(result.state.u[:, 2:], 0.0, atol=1e-6)
+
+
+def test_wssr_warm_svd_full_working_rank_matches_fallback_behavior():
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4, sr_rank=3, sr_rank_max=4, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [2.0, 0.5, -1.0, 0.25, 0.75],
+            [0.0, 1.5, 0.5, -0.75, -0.25],
+            [1.0, -0.25, 1.25, 0.5, 0.0],
+            [0.5, 0.75, -0.5, 2.0, -1.0],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.4])
+    kwargs = dict(
+        key=jax.random.PRNGKey(23),
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=1.5,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        constrain_update_norm=False,
+    )
+
+    fallback = wssr.wssr_warm_svd_core_update(o_aug, e_aug, state, **kwargs)
+    explicit_full = wssr.wssr_warm_svd_core_update(
+        o_aug,
+        e_aug,
+        state,
+        svd_working_rank=4,
+        **kwargs,
+    )
+
+    chex.assert_trees_all_close(
+        fallback.grad_like_update, explicit_full.grad_like_update, rtol=1e-5, atol=1e-5
+    )
+    chex.assert_trees_all_close(
+        fallback.state, explicit_full.state, rtol=1e-5, atol=1e-5
+    )
+    chex.assert_trees_all_close(fallback.active_rank, explicit_full.active_rank)
+
+
 def test_wssr_warm_svd_core_jits_and_preserves_rank_growth_history():
     state = wssr.initialize_wssr_warm_svd_core_state(
         num_params=4, sr_rank=2, sr_rank_max=4, dtype=jnp.float32
@@ -1042,6 +1165,7 @@ def test_wssr_warm_svd_core_jits_and_preserves_rank_growth_history():
             "sr_rank_max",
             "svd_maxiter_initial",
             "svd_maxiter_warm",
+            "svd_working_rank",
             "constrain_update_norm",
         ),
     )
@@ -1137,6 +1261,7 @@ def test_wssr_warm_svd_core_jitted_matches_eager_update_and_history():
             "sr_rank_max",
             "svd_maxiter_initial",
             "svd_maxiter_warm",
+            "svd_working_rank",
             "constrain_update_norm",
         ),
     )
@@ -1152,6 +1277,8 @@ def test_wssr_warm_svd_core_jitted_matches_eager_update_and_history():
     chex.assert_trees_all_close(eager.state.sr_rank, jitted.state.sr_rank)
     chex.assert_trees_all_close(eager.state.has_u, jitted.state.has_u)
     assert eager.state.u.shape == jitted.state.u.shape == state.u.shape
+    np.testing.assert_allclose(eager.state.u[:, 2:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(jitted.state.u[:, 2:], 0.0, atol=1e-6)
     assert jnp.all(jnp.isfinite(eager.state.u))
     assert jnp.all(jnp.isfinite(jitted.state.u))
 

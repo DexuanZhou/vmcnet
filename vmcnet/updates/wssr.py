@@ -1,5 +1,5 @@
 """WSSR low-rank stochastic reconfiguration helpers."""
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import chex
 import jax
@@ -200,13 +200,33 @@ def constrain_update_tree_norm(
     return jax.tree_util.tree_map(lambda update: update * safe_scale, updates)
 
 
+def _resolve_svd_working_rank(
+    svd_working_rank: Optional[int],
+    sr_rank_max: int,
+) -> int:
+    """Resolve the static warm-SVD compute width.
+
+    ``sr_rank_max`` remains the history/checkpoint capacity. The resolved value is
+    only the maximum width used by the warm-start SVD computation and rank growth.
+    Nonpositive values are treated as unset so command-line integer overrides can
+    use a default sentinel while preserving full-width behavior.
+    """
+    if svd_working_rank is None or svd_working_rank <= 0:
+        return sr_rank_max
+    return min(svd_working_rank, sr_rank_max)
+
+
 def _update_working_rank(active_rank: Array, sr_rank: Array, sr_rank_max: int, sr_scale):
-    proposed_rank = jnp.minimum(
-        jnp.ceil(sr_rank * sr_scale).astype(sr_rank.dtype),
+    capped_sr_rank = jnp.minimum(
+        sr_rank,
         jnp.asarray(sr_rank_max, dtype=sr_rank.dtype),
     )
-    should_grow = (active_rank == sr_rank) & (sr_rank < sr_rank_max)
-    return jnp.where(should_grow, proposed_rank, sr_rank)
+    proposed_rank = jnp.minimum(
+        jnp.ceil(capped_sr_rank * sr_scale).astype(sr_rank.dtype),
+        jnp.asarray(sr_rank_max, dtype=sr_rank.dtype),
+    )
+    should_grow = (active_rank == capped_sr_rank) & (capped_sr_rank < sr_rank_max)
+    return jnp.where(should_grow, proposed_rank, capped_sr_rank)
 
 
 def _zero_history_like(state: WSSRCoreState) -> WSSRCoreState:
@@ -241,9 +261,14 @@ def _wssr_update_from_svd(
     sr_rank_max: int,
     sr_scale: chex.Numeric,
     constrain_update_norm: bool,
+    rank_update_max: Optional[int] = None,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Apply the shared post-SVD WSSR update formula."""
+    if rank_update_max is None:
+        rank_update_max = sr_rank_max
+    rank_update_max = min(rank_update_max, sr_rank_max)
+
     if singular_values.shape[0] == 0:
         zero_state = _zero_history_like(state)
         return WSSRSVDResult(
@@ -289,9 +314,13 @@ def _wssr_update_from_svd(
     ek = ek.at[:history_width].set(ek_values)
 
     updated_sr_rank = _update_working_rank(
-        active_rank, state.sr_rank, sr_rank_max, sr_scale
+        active_rank, state.sr_rank, rank_update_max, sr_scale
     )
-    new_sr_rank = jnp.where(valid_update, updated_sr_rank, state.sr_rank)
+    capped_sr_rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_update_max, dtype=state.sr_rank.dtype),
+    )
+    new_sr_rank = jnp.where(valid_update, updated_sr_rank, capped_sr_rank)
     new_state = WSSRCoreState(
         sr_o=jnp.where(valid_update, sr_o, jnp.zeros_like(sr_o)),
         ek=jnp.where(valid_update, ek, jnp.zeros_like(ek)),
@@ -524,6 +553,7 @@ def warm_start_svd(
     key: Array,
     maxiter_initial: int,
     maxiter_warm: int,
+    svd_working_rank: Optional[int] = None,
 ) -> Tuple[Array, Array, Array, Array]:
     """Compute a warm-start subspace-iteration SVD approximation."""
     if maxiter_initial < 0:
@@ -531,7 +561,13 @@ def warm_start_svd(
     if maxiter_warm < 0:
         raise ValueError("maxiter_warm must be nonnegative")
 
-    rank_capacity = min(state.u.shape[1], o_aug.shape[0], o_aug.shape[1])
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    rank_capacity = min(
+        working_rank_max,
+        state.u.shape[1],
+        o_aug.shape[0],
+        o_aug.shape[1],
+    )
     if rank_capacity == 0:
         return (
             jnp.zeros((o_aug.shape[0], 0), dtype=o_aug.dtype),
@@ -593,6 +629,7 @@ def wssr_warm_svd_core_update(
     sr_scale: chex.Numeric = 1.1,
     svd_maxiter_initial: int = 8,
     svd_maxiter_warm: int = 2,
+    svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
@@ -605,12 +642,14 @@ def wssr_warm_svd_core_update(
             jnp.asarray(0, dtype=state.sr_rank.dtype),
         )
 
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, sr_rank_max)
     u, singular_values, vh, rank = warm_start_svd(
         o_aug,
         state,
         key,
         svd_maxiter_initial,
         svd_maxiter_warm,
+        svd_working_rank=working_rank_max,
     )
     result = _wssr_update_from_svd(
         o_aug,
@@ -624,6 +663,7 @@ def wssr_warm_svd_core_update(
         sr_rank_max,
         sr_scale,
         constrain_update_norm,
+        rank_update_max=working_rank_max,
         eps=eps,
     )
     u_state = jnp.zeros_like(state.u)
@@ -647,6 +687,7 @@ _jitted_wssr_warm_svd_core_update = jax.jit(
         "sr_rank_max",
         "svd_maxiter_initial",
         "svd_maxiter_warm",
+        "svd_working_rank",
         "constrain_update_norm",
     ),
 )
@@ -739,6 +780,7 @@ def compute_wssr_warm_svd_core_update(
     sr_scale: chex.Numeric = 1.1,
     svd_maxiter_initial: int = 8,
     svd_maxiter_warm: int = 2,
+    svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
 ) -> Tuple[P, WSSRWarmSVDCoreState, int]:
     """Compute a warm-start SVD WSSR core update and unflatten it."""
@@ -758,6 +800,7 @@ def compute_wssr_warm_svd_core_update(
         sr_scale=sr_scale,
         svd_maxiter_initial=svd_maxiter_initial,
         svd_maxiter_warm=svd_maxiter_warm,
+        svd_working_rank=svd_working_rank,
         constrain_update_norm=constrain_update_norm,
     )
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
@@ -928,6 +971,7 @@ def construct_wssr_warm_svd_update_param_fn(
             sr_scale=optimizer_config.sr_scale,
             svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
             svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
+            svd_working_rank=optimizer_config.get("svd_working_rank", None),
             constrain_update_norm=False,
         )
 

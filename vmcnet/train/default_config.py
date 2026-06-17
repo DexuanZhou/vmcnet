@@ -326,6 +326,7 @@ def get_default_vmc_config() -> Dict:
                 "sr_scale": 1.1,
                 "svd_maxiter_initial": 8,
                 "svd_maxiter_warm": 2,
+                "svd_working_rank": -1,
             },
             "gauss_newton": {
                 # Learning rate settings
