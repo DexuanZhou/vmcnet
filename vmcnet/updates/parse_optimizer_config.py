@@ -29,6 +29,7 @@ from .wssr import (
     initialize_wssr_sketch,
     initialize_wssr_svd,
     initialize_wssr_warm_svd,
+    initialize_wssr_warm_svd_right,
 )
 
 
@@ -232,6 +233,25 @@ def initialize_optimizer(
             update_data_fn,
             learning_rate_schedule,
             vmc_config.optimizer.wssr_warm_svd,
+            vmc_config.record_param_l1_norm,
+            apply_pmap=apply_pmap,
+        )
+        return update_param_fn, optimizer_state, key
+    elif vmc_config.optimizer_type == "wssr_warm_svd_right":
+        energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(
+            local_energy_fn, vmc_config.nchains, clipping_fn, vmc_config.nan_safe
+        )
+        (
+            update_param_fn,
+            optimizer_state,
+        ) = initialize_wssr_warm_svd_right(
+            log_psi_apply,
+            energy_and_statistics_fn,
+            params,
+            get_position_fn,
+            update_data_fn,
+            learning_rate_schedule,
+            vmc_config.optimizer.wssr_warm_svd_right,
             vmc_config.record_param_l1_norm,
             apply_pmap=apply_pmap,
         )

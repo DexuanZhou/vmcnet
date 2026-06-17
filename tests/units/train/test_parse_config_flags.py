@@ -98,6 +98,21 @@ def test_parse_config_accepts_wssr_warm_svd_optimizer_type(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_accepts_wssr_warm_svd_right_optimizer_type(mocker):
+    """Test that wssr_warm_svd_right is accepted as a visible optimizer option."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        ["vmcnet", "--config.vmc.optimizer_type=wssr_warm_svd_right"],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_warm_svd_right"
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_setting_duplicated_config_flag_sets_only_desired_flag(mocker):
     """Test changing normal_init.type only affects the desired instance of the flag.
 

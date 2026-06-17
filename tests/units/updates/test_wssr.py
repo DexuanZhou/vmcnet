@@ -125,6 +125,17 @@ def test_default_config_contains_wssr_warm_svd():
     assert config.vmc.optimizer.wssr_warm_svd.svd_working_rank == -1
 
 
+def test_default_config_contains_wssr_warm_svd_right():
+    config = default_config.get_default_config()
+
+    assert config.vmc.optimizer.wssr_warm_svd_right.learning_rate == 5e-2
+    assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank == 10
+    assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max == 100
+    assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial == 8
+    assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm == 2
+    assert config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank == -1
+
+
 def test_center_and_scale_score_matrix_uses_julia_convention():
     params = _tiny_params()
     positions = _tiny_positions()
@@ -1441,3 +1452,339 @@ def test_initialize_wssr_warm_svd_rejects_pmap_until_jit_safe_core_exists():
         assert "apply_pmap=False" in str(err)
     else:
         raise AssertionError("Expected wssr_warm_svd to reject apply_pmap=True")
+
+
+def test_wssr_warm_svd_right_uses_left_basis_state_shape():
+    right_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=3, sr_rank=2, sr_rank_max=5, dtype=jnp.float32
+    )
+    left_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=3, sr_rank=2, sr_rank_max=5, dtype=jnp.float32
+    )
+
+    assert right_state.sr_o.shape == (3, 5)
+    assert right_state.ek.shape == (5,)
+    assert right_state.u.shape == (3, 5)
+    assert right_state.has_u == jnp.array(False)
+    assert hasattr(left_state, "u")
+    assert not hasattr(left_state, "v")
+    chex.assert_trees_all_close(right_state, left_state)
+
+
+def test_wssr_warm_svd_right_matches_exact_svd_on_small_rank_controlled_case():
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4,
+        sr_rank=3,
+        sr_rank_max=4,
+        dtype=jnp.float32,
+    )
+    core_state = wssr.initialize_wssr_core_state(
+        num_params=4, sr_rank=3, sr_rank_max=4, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [4.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.25], dtype=jnp.float32)
+    key = jax.random.PRNGKey(42)
+
+    _, singular_values, _, rank = wssr.right_warm_start_svd(
+        o_aug,
+        state,
+        key,
+        maxiter_initial=1,
+        maxiter_warm=1,
+        svd_working_rank=3,
+    )
+    exact_singular_values = jnp.linalg.svd(o_aug, full_matrices=False)[1][:3]
+    chex.assert_trees_all_close(
+        singular_values[:3], exact_singular_values, rtol=1e-5, atol=1e-5
+    )
+    assert rank == 3
+
+    right_result = wssr.wssr_warm_svd_right_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key=key,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=1.1,
+        svd_maxiter_initial=1,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+    )
+    exact_result = wssr.wssr_svd_core_update(
+        o_aug,
+        e_aug,
+        core_state,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=1.1,
+        constrain_update_norm=False,
+    )
+
+    chex.assert_trees_all_close(
+        right_result.grad_like_update,
+        exact_result.grad_like_update,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    chex.assert_trees_all_close(
+        right_result.state.sr_o @ right_result.state.ek,
+        exact_result.state.sr_o @ exact_result.state.ek,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_wssr_warm_svd_right_core_jitted_matches_eager_update_and_history():
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=jnp.array(
+            [
+                [0.2, -0.1, 0.0, 0.0],
+                [0.4, 0.3, 0.0, 0.0],
+                [-0.5, 0.25, 0.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        ek=jnp.array([0.5, -0.25, 0.0, 0.0], dtype=jnp.float32),
+        sr_rank0=jnp.array(2),
+        sr_rank=jnp.array(2),
+        u=jnp.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        has_u=jnp.array(True),
+    )
+    o_aug = jnp.array(
+        [
+            [2.0, 0.5, -1.0, 0.25, 0.0],
+            [0.0, 1.5, 0.5, -0.75, 1.0],
+            [1.0, -0.25, 1.25, 0.5, -0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.25], dtype=jnp.float32)
+    key = jax.random.PRNGKey(123)
+    kwargs = dict(
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=4,
+        sr_scale=1.5,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+    )
+
+    eager = wssr.wssr_warm_svd_right_core_update(
+        o_aug, e_aug, state, key=key, **kwargs
+    )
+    jitted_update = jax.jit(
+        wssr.wssr_warm_svd_right_core_update,
+        static_argnames=(
+            "sr_rank_max",
+            "svd_maxiter_initial",
+            "svd_maxiter_warm",
+            "svd_working_rank",
+            "constrain_update_norm",
+        ),
+    )
+    jitted = jitted_update(o_aug, e_aug, state, key=key, **kwargs)
+    jitted.grad_like_update.block_until_ready()
+
+    chex.assert_trees_all_close(
+        eager.grad_like_update, jitted.grad_like_update, rtol=1e-5, atol=1e-5
+    )
+    chex.assert_trees_all_close(eager.state.sr_o, jitted.state.sr_o)
+    chex.assert_trees_all_close(eager.state.ek, jitted.state.ek)
+    chex.assert_trees_all_close(eager.state.sr_rank0, jitted.state.sr_rank0)
+    chex.assert_trees_all_close(eager.state.sr_rank, jitted.state.sr_rank)
+    chex.assert_trees_all_close(eager.state.has_u, jitted.state.has_u)
+    assert eager.state.u.shape == jitted.state.u.shape == state.u.shape
+    np.testing.assert_allclose(eager.state.u[:, 3:], 0.0, atol=1e-6)
+    np.testing.assert_allclose(jitted.state.u[:, 3:], 0.0, atol=1e-6)
+    assert not hasattr(eager.state, "v")
+    assert jnp.all(jnp.isfinite(eager.state.u))
+    assert jnp.all(jnp.isfinite(jitted.state.u))
+
+
+def test_wssr_warm_svd_right_rank_growth_caps_to_working_width_and_stores_history():
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4,
+        sr_rank=5,
+        sr_rank_max=6,
+        dtype=jnp.float32,
+    )
+    o_aug = jnp.array(
+        [
+            [5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.125, -0.75, 0.25, 0.1], dtype=jnp.float32)
+
+    result = wssr.wssr_warm_svd_right_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key=jax.random.PRNGKey(7),
+        damping=1e-4,
+        norm_constraint=10.0,
+        sr_rank_max=6,
+        sr_scale=2.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+    )
+
+    _assert_wssr_state_all_finite(result.state)
+    assert result.state.u.shape == (4, 6)
+    assert result.state.has_u == jnp.array(True)
+    assert result.state.sr_rank <= 3
+    assert result.state.sr_rank0 <= 3
+    assert jnp.any(result.state.u[:, :3] != 0.0)
+    assert jnp.all(result.state.u[:, 3:] == 0.0)
+    assert jnp.all(result.state.sr_o[:, 3:] == 0.0)
+    assert jnp.all(result.state.ek[3:] == 0.0)
+
+
+def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_state():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 2
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 5
+    config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 3
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(0),
+        apply_pmap=False,
+    )
+
+    assert callable(update_param_fn)
+    assert isinstance(optimizer_state, wssr.WSSROptimizerState)
+    assert isinstance(optimizer_state.core_state, wssr.WSSRWarmSVDCoreState)
+    assert optimizer_state.core_state.u.shape == (
+        3,
+        config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max,
+    )
+    assert optimizer_state.core_state.sr_o.shape == (
+        3,
+        config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max,
+    )
+    assert not hasattr(optimizer_state.core_state, "v")
+    assert optimizer_state.core_state.has_u == jnp.array(False)
+    assert key.shape == (2,)
+
+
+def test_wssr_warm_svd_right_integrated_two_updates_have_no_nans():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    config.vmc.optimizer.wssr_warm_svd_right.schedule_type = "constant"
+    config.vmc.optimizer.wssr_warm_svd_right.learning_rate = 0.125
+    config.vmc.optimizer.wssr_warm_svd_right.constrain_norm = False
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 2
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 5
+    config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 3
+    config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial = 2
+    config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm = 1
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(6),
+        apply_pmap=False,
+    )
+
+    params_1, data_1, state_1, metrics_1, key_1 = update_param_fn(
+        params, data, optimizer_state, key
+    )
+    params_2, data_2, state_2, metrics_2, key_2 = update_param_fn(
+        params_1, data_1, state_1, key_1
+    )
+
+    assert jax.tree_util.tree_structure(params_2) == jax.tree_util.tree_structure(
+        params
+    )
+    _assert_tree_all_finite(params_2)
+    _assert_wssr_state_all_finite(state_1.core_state)
+    _assert_wssr_state_all_finite(state_2.core_state)
+    assert state_1.core_state.has_u == jnp.array(True)
+    assert state_2.core_state.has_u == jnp.array(True)
+    assert state_2.core_state.u.shape == (
+        3,
+        config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max,
+    )
+    assert not hasattr(state_2.core_state, "v")
+    assert set(metrics_1).issuperset({"energy", "variance", "energy_noclip"})
+    assert set(metrics_2).issuperset({"energy", "variance", "energy_noclip"})
+    assert jnp.all(jnp.isfinite(jnp.asarray(list(metrics_1.values()))))
+    assert jnp.all(jnp.isfinite(jnp.asarray(list(metrics_2.values()))))
+    np.testing.assert_allclose(data_2, data)
+    assert key_1.shape == key.shape
+    assert key_2.shape == key.shape
+    assert not np.allclose(key_1, key)
+    assert not np.allclose(key_2, key_1)
+
+
+def test_initialize_wssr_warm_svd_right_rejects_pmap_until_jit_safe_core_exists():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+
+    try:
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=True,
+        )
+    except NotImplementedError as err:
+        assert "apply_pmap=False" in str(err)
+    else:
+        raise AssertionError("Expected wssr_warm_svd_right to reject apply_pmap=True")

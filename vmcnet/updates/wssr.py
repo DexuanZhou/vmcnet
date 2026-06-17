@@ -618,6 +618,88 @@ def warm_start_svd(
     return u_final, singular_values, vh, rank
 
 
+def right_warm_start_svd(
+    o_aug: Array,
+    state: WSSRWarmSVDCoreState,
+    key: Array,
+    maxiter_initial: int,
+    maxiter_warm: int,
+    svd_working_rank: Optional[int] = None,
+    eps: chex.Numeric = 1e-12,
+) -> Tuple[Array, Array, Array, Array, Array]:
+    """Compute a warm-start SVD approximation from the right subspace.
+
+    This variant still persists the left basis ``state.u`` for checkpoint
+    compatibility. On each update it projects that warm start into the right
+    augmented-column space, performs right-subspace iteration there, and recovers
+    a fresh left basis for the shared WSSR post-SVD update.
+    """
+    if maxiter_initial < 0:
+        raise ValueError("maxiter_initial must be nonnegative")
+    if maxiter_warm < 0:
+        raise ValueError("maxiter_warm must be nonnegative")
+
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    rank_capacity = min(
+        working_rank_max,
+        state.u.shape[1],
+        o_aug.shape[0],
+        o_aug.shape[1],
+    )
+    if rank_capacity == 0:
+        return (
+            jnp.zeros((o_aug.shape[0], 0), dtype=o_aug.dtype),
+            jnp.zeros((0,), dtype=o_aug.dtype),
+            jnp.zeros((0, o_aug.shape[1]), dtype=o_aug.dtype),
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
+
+    rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_capacity, dtype=state.sr_rank.dtype),
+    )
+    rank_mask = (jnp.arange(rank_capacity) < rank).astype(o_aug.dtype)
+
+    def _masked_qr(z):
+        q, _ = jnp.linalg.qr(z, mode="reduced")
+        return q * rank_mask
+
+    def _subspace_iterate(v, n_iter):
+        for _ in range(n_iter):
+            y = o_aug @ v
+            z = o_aug.T @ y
+            v = _masked_qr(z)
+        return v
+
+    def _warm_branch(_):
+        u0 = state.u[:, :rank_capacity] * rank_mask
+        v = _masked_qr(o_aug.T @ u0)
+        return _subspace_iterate(v, maxiter_warm)
+
+    def _initial_branch(_):
+        omega = jax.random.normal(
+            key, (o_aug.shape[1], rank_capacity), dtype=o_aug.dtype
+        )
+        omega = omega * rank_mask
+        v = _masked_qr(omega)
+        return _subspace_iterate(v, maxiter_initial)
+
+    v = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
+    y = o_aug @ v
+    gram = y.T @ y
+    eigvals, right_rot = jnp.linalg.eigh(gram)
+    order = jnp.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    right_rot = right_rot[:, order]
+    singular_values = jnp.sqrt(jnp.maximum(eigvals, 0.0)) * rank_mask
+
+    safe_singular_values = jnp.where(singular_values > eps, singular_values, 1.0)
+    u = (y @ right_rot) / safe_singular_values
+    u = u * rank_mask
+    vh = (v @ right_rot).T * rank_mask[:, None]
+    return u, singular_values, vh, rank
+
+
 def wssr_warm_svd_core_update(
     o_aug: Array,
     e_aug: Array,
@@ -683,6 +765,82 @@ def wssr_warm_svd_core_update(
 
 _jitted_wssr_warm_svd_core_update = jax.jit(
     wssr_warm_svd_core_update,
+    static_argnames=(
+        "sr_rank_max",
+        "svd_maxiter_initial",
+        "svd_maxiter_warm",
+        "svd_working_rank",
+        "constrain_update_norm",
+    ),
+)
+
+
+def wssr_warm_svd_right_core_update(
+    o_aug: Array,
+    e_aug: Array,
+    state: WSSRWarmSVDCoreState,
+    key: Array,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    svd_maxiter_initial: int = 8,
+    svd_maxiter_warm: int = 2,
+    svd_working_rank: Optional[int] = None,
+    constrain_update_norm: bool = True,
+    eps: chex.Numeric = 1e-12,
+) -> WSSRSVDResult:
+    """Compute one right-subspace warm-start SVD WSSR core update."""
+    if sr_rank_max == 0:
+        zero_state = _zero_warm_svd_history_like(state)
+        return WSSRSVDResult(
+            jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype),
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
+
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, sr_rank_max)
+    u, singular_values, vh, rank = right_warm_start_svd(
+        o_aug,
+        state,
+        key,
+        svd_maxiter_initial,
+        svd_maxiter_warm,
+        svd_working_rank=working_rank_max,
+        eps=eps,
+    )
+    result = _wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale,
+        constrain_update_norm,
+        rank_update_max=working_rank_max,
+        eps=eps,
+    )
+    u_state = jnp.zeros_like(state.u)
+    warm_width = min(u.shape[1], state.u.shape[1])
+    rank_mask = (jnp.arange(warm_width) < rank).astype(u.dtype)
+    u_state = u_state.at[:, :warm_width].set(u[:, :warm_width] * rank_mask)
+    warm_state = WSSRWarmSVDCoreState(
+        sr_o=result.state.sr_o,
+        ek=result.state.ek,
+        sr_rank0=result.state.sr_rank0,
+        sr_rank=result.state.sr_rank,
+        u=u_state,
+        has_u=jnp.where(rank > 0, jnp.array(True), state.has_u),
+    )
+    return WSSRSVDResult(result.grad_like_update, warm_state, result.active_rank)
+
+
+_jitted_wssr_warm_svd_right_core_update = jax.jit(
+    wssr_warm_svd_right_core_update,
     static_argnames=(
         "sr_rank_max",
         "svd_maxiter_initial",
@@ -790,6 +948,47 @@ def compute_wssr_warm_svd_core_update(
     e_cur = center_and_scale_energy_residuals(local_energies, energy)
     o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
     result = _jitted_wssr_warm_svd_core_update(
+        o_aug,
+        e_aug,
+        state,
+        key,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale=sr_scale,
+        svd_maxiter_initial=svd_maxiter_initial,
+        svd_maxiter_warm=svd_maxiter_warm,
+        svd_working_rank=svd_working_rank,
+        constrain_update_norm=constrain_update_norm,
+    )
+    return unravel_fn(result.grad_like_update), result.state, result.active_rank
+
+
+def compute_wssr_warm_svd_right_core_update(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    local_energies: Array,
+    energy: Array,
+    state: WSSRWarmSVDCoreState,
+    key: Array,
+    eta: chex.Numeric,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    svd_maxiter_initial: int = 8,
+    svd_maxiter_warm: int = 2,
+    svd_working_rank: Optional[int] = None,
+    constrain_update_norm: bool = True,
+) -> Tuple[P, WSSRWarmSVDCoreState, int]:
+    """Compute a right-subspace warm-start SVD WSSR update and unflatten it."""
+    o_cur, unravel_fn = center_and_scale_score_matrix(
+        log_psi_apply, params, positions
+    )
+    e_cur = center_and_scale_energy_residuals(local_energies, energy)
+    o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
+    result = _jitted_wssr_warm_svd_right_core_update(
         o_aug,
         e_aug,
         state,
@@ -1005,6 +1204,71 @@ def construct_wssr_warm_svd_update_param_fn(
     return jax.jit(update_param_fn)
 
 
+def construct_wssr_warm_svd_right_update_param_fn(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    optimizer: optax.GradientTransformation,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+) -> UpdateParamFn[P, D, WSSROptimizerState]:
+    """Create the integrated right-subspace warm-start SVD WSSR update function."""
+
+    def update_param_fn(params, data, optimizer_state, key):
+        position = get_position_fn(data)
+        energy, local_energies, stats = energy_and_statistics_fn(params, position)
+        key, svd_key = jax.random.split(key)
+
+        grad_like_update, core_state, _ = compute_wssr_warm_svd_right_core_update(
+            log_psi_apply,
+            params,
+            position,
+            local_energies,
+            energy,
+            optimizer_state.core_state,
+            svd_key,
+            optimizer_config.eta,
+            optimizer_config.damping,
+            optimizer_config.norm_constraint,
+            optimizer_config.sr_rank_max,
+            sr_scale=optimizer_config.sr_scale,
+            svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
+            svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
+            svd_working_rank=optimizer_config.get("svd_working_rank", None),
+            constrain_update_norm=False,
+        )
+
+        updates, optax_state = optimizer.update(
+            grad_like_update, optimizer_state.optax_state, params
+        )
+        if optimizer_config.constrain_norm:
+            updates = constrain_update_tree_norm(
+                updates, optimizer_config.norm_constraint
+            )
+        params = optax.apply_updates(params, updates)
+        data = update_data_fn(data, params)
+
+        metrics = {"energy": energy, "variance": stats["variance"]}
+        metrics = update_metrics_with_noclip(
+            stats["energy_noclip"],
+            stats["variance_noclip"],
+            metrics,
+        )
+        if record_param_l1_norm:
+            metrics.update({"param_l1_norm": tree_reduce_l1(params)})
+
+        return (
+            params,
+            data,
+            WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+            metrics,
+            key,
+        )
+
+    return jax.jit(update_param_fn)
+
+
 def initialize_wssr_svd(
     log_psi_apply: ModelApply[P],
     energy_and_statistics_fn,
@@ -1116,6 +1380,49 @@ def initialize_wssr_warm_svd(
     )
     optax_state = optimizer.init(params)
     update_param_fn = construct_wssr_warm_svd_update_param_fn(
+        log_psi_apply,
+        energy_and_statistics_fn,
+        optimizer,
+        get_position_fn,
+        update_data_fn,
+        optimizer_config,
+        record_param_l1_norm=record_param_l1_norm,
+    )
+    return (
+        update_param_fn,
+        WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+    )
+
+
+def initialize_wssr_warm_svd_right(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    params: P,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    learning_rate_schedule: LearningRateSchedule,
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+    apply_pmap: bool = True,
+) -> Tuple[UpdateParamFn[P, D, WSSROptimizerState], WSSROptimizerState]:
+    """Get an update function and initial state for right warm-start SVD WSSR."""
+    if apply_pmap:
+        raise NotImplementedError(
+            "wssr_warm_svd_right currently supports apply_pmap=False only"
+        )
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    core_state = initialize_wssr_warm_svd_core_state(
+        flat_params.shape[0],
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        dtype=flat_params.dtype,
+    )
+    optimizer = optax.sgd(
+        learning_rate=learning_rate_schedule, momentum=0, nesterov=False
+    )
+    optax_state = optimizer.init(params)
+    update_param_fn = construct_wssr_warm_svd_right_update_param_fn(
         log_psi_apply,
         energy_and_statistics_fn,
         optimizer,
