@@ -1,6 +1,4 @@
 """WSSR low-rank stochastic reconfiguration helpers."""
-
-import math
 from typing import NamedTuple, Tuple
 
 import chex
@@ -53,7 +51,7 @@ class WSSRSVDResult(NamedTuple):
 
     grad_like_update: Array
     state: WSSRCoreState
-    active_rank: int
+    active_rank: Array
 
 
 class WSSROptimizerState(NamedTuple):
@@ -116,11 +114,15 @@ def center_and_scale_score_matrix(
 
     _, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
-    def ravel_grad_log_psi(position):
-        grad = jax.grad(log_psi_apply, argnums=0)(params, position)
-        return jax.flatten_util.ravel_pytree(grad)[0]
-
-    score_samples = jax.vmap(ravel_grad_log_psi, in_axes=0)(positions)
+    grad_samples = jax.vmap(
+        jax.grad(log_psi_apply, argnums=0),
+        in_axes=(None, 0),
+    )(params, positions)
+    flat_score_leaves = [
+        jnp.reshape(leaf, (positions.shape[0], -1))
+        for leaf in jax.tree_util.tree_leaves(grad_samples)
+    ]
+    score_samples = jnp.concatenate(flat_score_leaves, axis=1)
     score_samples = score_samples - jnp.mean(score_samples, axis=0, keepdims=True)
     scale = jnp.sqrt(positions.shape[0])
     return score_samples.T / scale, unravel_fn
@@ -140,19 +142,21 @@ def augment_wssr_system(
 ) -> Tuple[Array, Array]:
     """Create history-augmented WSSR score matrix and residual vector.
 
-    This PR 1 helper uses Python integer slicing and is intended for eager core tests,
-    not as the final jitted integration path.
+    The output has fixed width ``sr_rank_max + num_samples``. Inactive history
+    columns are zeroed so that the WSSR equations match the dynamic active-history
+    augmentation while remaining JIT-safe.
     """
-    active_rank = int(state.sr_rank0)
-    if active_rank == 0:
-        return o_cur, e_cur
-
+    history_width = state.sr_o.shape[1]
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(o_cur.dtype)
+    has_history = state.sr_rank0 > 0
     sqrt_eta = jnp.sqrt(eta)
-    sqrt_one_minus_eta = jnp.sqrt(1.0 - eta)
-    o_hist = sqrt_eta * state.sr_o[:, :active_rank]
-    e_hist = sqrt_eta * state.ek[:active_rank]
-    o_scaled = sqrt_one_minus_eta * o_cur
-    e_scaled = sqrt_one_minus_eta * e_cur
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        o_cur.dtype
+    )
+    o_hist = sqrt_eta * state.sr_o * history_mask
+    e_hist = sqrt_eta * state.ek * history_mask
+    o_scaled = current_scale * o_cur
+    e_scaled = current_scale * e_cur
     return jnp.concatenate([o_hist, o_scaled], axis=1), jnp.concatenate(
         [e_hist, e_scaled], axis=0
     )
@@ -196,10 +200,13 @@ def constrain_update_tree_norm(
     return jax.tree_util.tree_map(lambda update: update * safe_scale, updates)
 
 
-def _update_working_rank(active_rank: int, sr_rank: int, sr_rank_max: int, sr_scale):
-    if active_rank == sr_rank and sr_rank < sr_rank_max:
-        return min(int(math.ceil(sr_rank * sr_scale)), sr_rank_max)
-    return sr_rank
+def _update_working_rank(active_rank: Array, sr_rank: Array, sr_rank_max: int, sr_scale):
+    proposed_rank = jnp.minimum(
+        jnp.ceil(sr_rank * sr_scale).astype(sr_rank.dtype),
+        jnp.asarray(sr_rank_max, dtype=sr_rank.dtype),
+    )
+    should_grow = (active_rank == sr_rank) & (sr_rank < sr_rank_max)
+    return jnp.where(should_grow, proposed_rank, sr_rank)
 
 
 def _zero_history_like(state: WSSRCoreState) -> WSSRCoreState:
@@ -239,46 +246,59 @@ def _wssr_update_from_svd(
     """Apply the shared post-SVD WSSR update formula."""
     if singular_values.shape[0] == 0:
         zero_state = _zero_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+        return WSSRSVDResult(
+            jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype),
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
 
     leading_sv = singular_values[0]
-    if bool(leading_sv <= eps):
-        zero_state = _zero_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+    valid_leading = leading_sv > eps
+    safe_leading_sv = jnp.where(valid_leading, leading_sv, 1.0)
+    retained = (singular_values / safe_leading_sv > damping) & valid_leading
+    active_rank = jnp.sum(retained.astype(state.sr_rank.dtype))
+    has_active_rank = active_rank > 0
+    valid_update = valid_leading & has_active_rank
+    retained_float = retained.astype(o_aug.dtype)
 
-    retained = singular_values / leading_sv > damping
-    active_rank = int(jnp.sum(retained))
-    if active_rank == 0:
-        zero_state = _zero_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
-
-    u_active = u[:, :active_rank]
-    s_active = singular_values[:active_rank]
-    v_active = vh[:active_rank, :].T
-
+    safe_singular_values = jnp.where(retained, singular_values, 1.0)
     safe_damping = jnp.maximum(jnp.abs(damping), eps)
-    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(leading_sv))
+    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(safe_leading_sv))
     force = o_aug @ e_aug
-    projected_force = u_active.T @ force
-    projected_force = projected_force * (jnp.square(1.0 / s_active) - sigma0)
-    grad_like_update = u_active @ projected_force + sigma0 * force
+    projected_force = u.T @ force
+    projected_force = projected_force * (
+        jnp.square(1.0 / safe_singular_values) - sigma0
+    )
+    projected_force = projected_force * retained_float
+    grad_like_update = u @ projected_force + sigma0 * force
+    grad_like_update = jnp.where(valid_update, grad_like_update, 0.0)
 
     if constrain_update_norm:
         grad_like_update = constrain_norm(grad_like_update, norm_constraint, eps=eps)
 
     sr_o = jnp.zeros_like(state.sr_o)
     ek = jnp.zeros_like(state.ek)
-    sr_o = sr_o.at[:, :active_rank].set(u_active * s_active)
-    ek = ek.at[:active_rank].set(v_active.T @ e_aug)
-
-    new_sr_rank = _update_working_rank(
-        active_rank, int(state.sr_rank), sr_rank_max, sr_scale
+    history_width = min(singular_values.shape[0], sr_rank_max)
+    sr_o_values = (
+        u[:, :history_width]
+        * singular_values[:history_width]
+        * retained_float[:history_width]
     )
+    ek_values = (vh[:history_width, :] @ e_aug) * retained_float[:history_width]
+    sr_o = sr_o.at[:, :history_width].set(sr_o_values)
+    ek = ek.at[:history_width].set(ek_values)
+
+    updated_sr_rank = _update_working_rank(
+        active_rank, state.sr_rank, sr_rank_max, sr_scale
+    )
+    new_sr_rank = jnp.where(valid_update, updated_sr_rank, state.sr_rank)
     new_state = WSSRCoreState(
-        sr_o=sr_o,
-        ek=ek,
-        sr_rank0=jnp.array(active_rank),
-        sr_rank=jnp.array(new_sr_rank),
+        sr_o=jnp.where(valid_update, sr_o, jnp.zeros_like(sr_o)),
+        ek=jnp.where(valid_update, ek, jnp.zeros_like(ek)),
+        sr_rank0=jnp.where(
+            valid_update, active_rank, jnp.asarray(0, dtype=state.sr_rank0.dtype)
+        ),
+        sr_rank=new_sr_rank,
     )
     return WSSRSVDResult(grad_like_update, new_state, active_rank)
 
@@ -434,41 +454,62 @@ def warm_start_svd(
     key: Array,
     maxiter_initial: int,
     maxiter_warm: int,
-) -> Tuple[Array, Array, Array, int]:
+) -> Tuple[Array, Array, Array, Array]:
     """Compute a warm-start subspace-iteration SVD approximation."""
     if maxiter_initial < 0:
         raise ValueError("maxiter_initial must be nonnegative")
     if maxiter_warm < 0:
         raise ValueError("maxiter_warm must be nonnegative")
 
-    rank = min(int(state.sr_rank), o_aug.shape[0], o_aug.shape[1])
-    if rank == 0:
+    rank_capacity = min(state.u.shape[1], o_aug.shape[0], o_aug.shape[1])
+    if rank_capacity == 0:
         return (
             jnp.zeros((o_aug.shape[0], 0), dtype=o_aug.dtype),
             jnp.zeros((0,), dtype=o_aug.dtype),
             jnp.zeros((0, o_aug.shape[1]), dtype=o_aug.dtype),
-            0,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
         )
 
-    if bool(state.has_u):
-        u0 = state.u[:, :rank]
+    rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_capacity, dtype=state.sr_rank.dtype),
+    )
+    rank_mask = (jnp.arange(rank_capacity) < rank).astype(o_aug.dtype)
+
+    def _masked_qr(y):
+        q, _ = jnp.linalg.qr(y, mode="reduced")
+        return q * rank_mask
+
+    def _subspace_iterate(u, n_iter):
+        for _ in range(n_iter):
+            z = o_aug.T @ u
+            y = o_aug @ z
+            u = _masked_qr(y)
+        return u
+
+    def _warm_branch(_):
+        u0 = state.u[:, :rank_capacity] * rank_mask
         u, _ = jnp.linalg.qr(u0, mode="reduced")
-        n_iter = maxiter_warm
-    else:
-        omega = jax.random.normal(key, (o_aug.shape[1], rank), dtype=o_aug.dtype)
+        u = u * rank_mask
+        return _subspace_iterate(u, maxiter_warm)
+
+    def _initial_branch(_):
+        omega = jax.random.normal(
+            key, (o_aug.shape[1], rank_capacity), dtype=o_aug.dtype
+        )
+        omega = omega * rank_mask
         y = o_aug @ omega
-        u, _ = jnp.linalg.qr(y, mode="reduced")
-        n_iter = maxiter_initial
+        u = _masked_qr(y)
+        return _subspace_iterate(u, maxiter_initial)
 
-    for _ in range(n_iter):
-        z = o_aug.T @ u
-        y = o_aug @ z
-        u, _ = jnp.linalg.qr(y, mode="reduced")
-
+    u = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
     b = u.T @ o_aug
     u_hat, singular_values, vh = jnp.linalg.svd(b, full_matrices=False)
-    u_final = u @ u_hat
-    return u_final[:, :rank], singular_values[:rank], vh[:rank, :], rank
+    factor_mask = (jnp.arange(singular_values.shape[0]) < rank).astype(o_aug.dtype)
+    singular_values = singular_values * factor_mask
+    u_final = (u @ u_hat) * factor_mask
+    vh = vh * factor_mask[:, None]
+    return u_final, singular_values, vh, rank
 
 
 def wssr_warm_svd_core_update(
@@ -486,9 +527,13 @@ def wssr_warm_svd_core_update(
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Compute one warm-start subspace-iteration WSSR core update."""
-    if int(state.sr_rank) == 0 or sr_rank_max == 0:
+    if sr_rank_max == 0:
         zero_state = _zero_warm_svd_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
+        return WSSRSVDResult(
+            jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype),
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
 
     u, singular_values, vh, rank = warm_start_svd(
         o_aug,
@@ -497,10 +542,6 @@ def wssr_warm_svd_core_update(
         svd_maxiter_initial,
         svd_maxiter_warm,
     )
-    if rank == 0:
-        zero_state = _zero_warm_svd_history_like(state)
-        return WSSRSVDResult(jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype), zero_state, 0)
-
     result = _wssr_update_from_svd(
         o_aug,
         e_aug,
@@ -516,16 +557,29 @@ def wssr_warm_svd_core_update(
         eps=eps,
     )
     u_state = jnp.zeros_like(state.u)
-    u_state = u_state.at[:, :rank].set(u[:, :rank])
+    warm_width = min(u.shape[1], state.u.shape[1])
+    rank_mask = (jnp.arange(warm_width) < rank).astype(u.dtype)
+    u_state = u_state.at[:, :warm_width].set(u[:, :warm_width] * rank_mask)
     warm_state = WSSRWarmSVDCoreState(
         sr_o=result.state.sr_o,
         ek=result.state.ek,
         sr_rank0=result.state.sr_rank0,
         sr_rank=result.state.sr_rank,
         u=u_state,
-        has_u=jnp.array(True),
+        has_u=jnp.where(rank > 0, jnp.array(True), state.has_u),
     )
     return WSSRSVDResult(result.grad_like_update, warm_state, result.active_rank)
+
+
+_jitted_wssr_warm_svd_core_update = jax.jit(
+    wssr_warm_svd_core_update,
+    static_argnames=(
+        "sr_rank_max",
+        "svd_maxiter_initial",
+        "svd_maxiter_warm",
+        "constrain_update_norm",
+    ),
+)
 
 
 def compute_wssr_svd_core_update(
@@ -623,7 +677,7 @@ def compute_wssr_warm_svd_core_update(
     )
     e_cur = center_and_scale_energy_residuals(local_energies, energy)
     o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
-    result = wssr_warm_svd_core_update(
+    result = _jitted_wssr_warm_svd_core_update(
         o_aug,
         e_aug,
         state,
@@ -834,7 +888,7 @@ def construct_wssr_warm_svd_update_param_fn(
             key,
         )
 
-    return update_param_fn
+    return jax.jit(update_param_fn)
 
 
 def initialize_wssr_svd(
