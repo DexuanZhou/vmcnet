@@ -151,6 +151,35 @@ def score_matvec_current(
     return flat_grad
 
 
+def score_matmat_current(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    sample_weight_matrix: Array,
+) -> Array:
+    """Compute ``O_cur @ sample_weight_matrix`` without materializing ``O_cur``.
+
+    ``O_cur`` is the centered and ``1 / sqrt(num_samples)``-scaled score
+    matrix returned by :func:`center_and_scale_score_matrix`.
+    """
+
+    def log_psi_samples(params):
+        return jax.vmap(log_psi_apply, in_axes=(None, 0))(params, positions)
+
+    centered_weights = sample_weight_matrix - jnp.mean(
+        sample_weight_matrix, axis=0, keepdims=True
+    )
+    scaled_weights = centered_weights / jnp.sqrt(positions.shape[0])
+    _, pullback = jax.vjp(log_psi_samples, params)
+
+    def pullback_flat(sample_weights):
+        grad_tree = pullback(sample_weights)[0]
+        flat_grad, _ = jax.flatten_util.ravel_pytree(grad_tree)
+        return flat_grad
+
+    return jax.vmap(pullback_flat, in_axes=1, out_axes=1)(scaled_weights)
+
+
 def score_rmatvec_current(
     log_psi_apply: ModelApply[P],
     params: P,
@@ -172,6 +201,34 @@ def score_rmatvec_current(
     _, jvp_values = jax.jvp(log_psi_samples, (params,), (param_tangent,))
     centered_jvp_values = jvp_values - jnp.mean(jvp_values)
     return centered_jvp_values / jnp.sqrt(positions.shape[0])
+
+
+def score_rmatmat_current(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    param_matrix: Array,
+) -> Array:
+    """Compute ``O_cur.T @ param_matrix`` without materializing ``O_cur``.
+
+    ``O_cur`` is the centered and ``1 / sqrt(num_samples)``-scaled score
+    matrix returned by :func:`center_and_scale_score_matrix`.
+    """
+
+    _, unravel_fn = jax.flatten_util.ravel_pytree(params)
+
+    def log_psi_samples(params):
+        return jax.vmap(log_psi_apply, in_axes=(None, 0))(params, positions)
+
+    _, linear_fn = jax.linearize(log_psi_samples, params)
+
+    def jvp_values(param_vector):
+        param_tangent = unravel_fn(param_vector)
+        return linear_fn(param_tangent)
+
+    jvp_matrix = jax.vmap(jvp_values, in_axes=1, out_axes=1)(param_matrix)
+    centered_jvp_matrix = jvp_matrix - jnp.mean(jvp_matrix, axis=0, keepdims=True)
+    return centered_jvp_matrix / jnp.sqrt(positions.shape[0])
 
 
 def wssr_augmented_matvec(
@@ -241,13 +298,22 @@ def wssr_augmented_matmat(
     aug_matrix: Array,
 ) -> Array:
     """Compute ``O_aug @ aug_matrix`` without materializing current scores."""
-    return jax.vmap(
-        lambda aug_vector: wssr_augmented_matvec(
-            log_psi_apply, params, positions, state, eta, aug_vector
-        ),
-        in_axes=1,
-        out_axes=1,
-    )(aug_matrix)
+    history_width = state.sr_o.shape[1]
+    v_hist = aug_matrix[:history_width, :]
+    v_cur = aug_matrix[history_width:, :]
+
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(v_hist.dtype)
+    has_history = state.sr_rank0 > 0
+    sqrt_eta = jnp.sqrt(eta)
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        v_cur.dtype
+    )
+
+    history_term = sqrt_eta * (state.sr_o @ (history_mask[:, None] * v_hist))
+    current_term = current_scale * score_matmat_current(
+        log_psi_apply, params, positions, v_cur
+    )
+    return history_term + current_term
 
 
 def wssr_augmented_rmatmat(
@@ -259,13 +325,21 @@ def wssr_augmented_rmatmat(
     param_matrix: Array,
 ) -> Array:
     """Compute ``O_aug.T @ param_matrix`` without materializing current scores."""
-    return jax.vmap(
-        lambda param_vector: wssr_augmented_rmatvec(
-            log_psi_apply, params, positions, state, eta, param_vector
-        ),
-        in_axes=1,
-        out_axes=1,
-    )(param_matrix)
+    history_width = state.sr_o.shape[1]
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(
+        param_matrix.dtype
+    )
+    has_history = state.sr_rank0 > 0
+    sqrt_eta = jnp.sqrt(eta)
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        param_matrix.dtype
+    )
+
+    history_term = sqrt_eta * history_mask[:, None] * (state.sr_o.T @ param_matrix)
+    current_term = current_scale * score_rmatmat_current(
+        log_psi_apply, params, positions, param_matrix
+    )
+    return jnp.concatenate([history_term, current_term], axis=0)
 
 
 def center_and_scale_energy_residuals(local_energies: Array, energy: Array) -> Array:

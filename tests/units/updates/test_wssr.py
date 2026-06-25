@@ -201,6 +201,22 @@ def _assert_matrix_free_score_products_match_explicit(
     o_cur, _ = wssr.center_and_scale_score_matrix(log_psi_apply, params, positions)
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
     param_vector = jnp.linspace(-0.7, 0.9, flat_params.shape[0])
+    sample_weight_matrix = jnp.stack(
+        [
+            sample_weights,
+            jnp.linspace(0.8, -1.2, positions.shape[0]),
+            jnp.linspace(-0.4, 1.6, positions.shape[0]),
+        ],
+        axis=1,
+    )
+    param_matrix = jnp.stack(
+        [
+            param_vector,
+            jnp.linspace(1.1, -0.3, flat_params.shape[0]),
+            jnp.linspace(-1.4, 0.2, flat_params.shape[0]),
+        ],
+        axis=1,
+    )
 
     matvec = wssr.score_matvec_current(
         log_psi_apply, params, positions, sample_weights
@@ -208,9 +224,21 @@ def _assert_matrix_free_score_products_match_explicit(
     rmatvec = wssr.score_rmatvec_current(
         log_psi_apply, params, positions, param_vector
     )
+    matmat = wssr.score_matmat_current(
+        log_psi_apply, params, positions, sample_weight_matrix
+    )
+    rmatmat = wssr.score_rmatmat_current(
+        log_psi_apply, params, positions, param_matrix
+    )
 
     np.testing.assert_allclose(matvec, o_cur @ sample_weights, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(rmatvec, o_cur.T @ param_vector, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        matmat, o_cur @ sample_weight_matrix, rtol=1e-4, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        rmatmat, o_cur.T @ param_matrix, rtol=1e-4, atol=1e-4
+    )
 
 
 def test_matrix_free_score_products_match_explicit_when_samples_exceed_params():
@@ -260,6 +288,22 @@ def _assert_augmented_matrix_free_products_match_explicit(
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
     aug_vector = jnp.linspace(-0.8, 1.1, state.sr_o.shape[1] + positions.shape[0])
     param_vector = jnp.linspace(0.7, -0.9, flat_params.shape[0])
+    aug_matrix = jnp.stack(
+        [
+            aug_vector,
+            jnp.linspace(1.2, -0.6, aug_vector.shape[0]),
+            jnp.linspace(-1.5, 0.25, aug_vector.shape[0]),
+        ],
+        axis=1,
+    )
+    param_matrix = jnp.stack(
+        [
+            param_vector,
+            jnp.linspace(-0.4, 1.3, flat_params.shape[0]),
+            jnp.linspace(1.6, -0.2, flat_params.shape[0]),
+        ],
+        axis=1,
+    )
 
     matvec = wssr.wssr_augmented_matvec(
         log_psi_apply, params, positions, state, eta, aug_vector
@@ -267,9 +311,19 @@ def _assert_augmented_matrix_free_products_match_explicit(
     rmatvec = wssr.wssr_augmented_rmatvec(
         log_psi_apply, params, positions, state, eta, param_vector
     )
+    matmat = wssr.wssr_augmented_matmat(
+        log_psi_apply, params, positions, state, eta, aug_matrix
+    )
+    rmatmat = wssr.wssr_augmented_rmatmat(
+        log_psi_apply, params, positions, state, eta, param_matrix
+    )
 
     np.testing.assert_allclose(matvec, o_aug @ aug_vector, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(rmatvec, o_aug.T @ param_vector, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(matmat, o_aug @ aug_matrix, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        rmatmat, o_aug.T @ param_matrix, rtol=1e-4, atol=1e-4
+    )
 
 
 def test_augmented_matrix_free_products_match_explicit_without_active_history():
