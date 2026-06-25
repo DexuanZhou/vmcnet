@@ -1613,6 +1613,183 @@ def test_wssr_warm_svd_right_uses_left_basis_state_shape():
     chex.assert_trees_all_close(right_state, left_state)
 
 
+def _assert_right_warm_start_svd_matfree_matches_explicit(
+    log_psi_apply,
+    params,
+    positions,
+    state,
+    eta,
+    key,
+    svd_working_rank,
+    maxiter_initial,
+    maxiter_warm,
+):
+    o_cur, _ = wssr.center_and_scale_score_matrix(log_psi_apply, params, positions)
+    e_cur = jnp.linspace(-0.3, 0.5, positions.shape[0])
+    o_aug, e_aug = wssr.augment_wssr_system(o_cur, e_cur, state, eta)
+    explicit = wssr.right_warm_start_svd(
+        o_aug,
+        state,
+        key,
+        maxiter_initial=maxiter_initial,
+        maxiter_warm=maxiter_warm,
+        svd_working_rank=svd_working_rank,
+    )
+    matfree = wssr.right_warm_start_svd_matfree(
+        log_psi_apply,
+        params,
+        positions,
+        state,
+        eta,
+        key,
+        maxiter_initial=maxiter_initial,
+        maxiter_warm=maxiter_warm,
+        svd_working_rank=svd_working_rank,
+    )
+    u_explicit, s_explicit, vh_explicit, rank_explicit = explicit
+    u_matfree, s_matfree, vh_matfree, rank_matfree = matfree
+    active_rank = int(rank_explicit)
+
+    chex.assert_trees_all_close(rank_matfree, rank_explicit)
+    np.testing.assert_allclose(s_matfree, s_explicit, rtol=1e-4, atol=1e-4)
+    assert u_matfree.shape == u_explicit.shape
+    assert vh_matfree.shape == vh_explicit.shape
+
+    u_projector_explicit = u_explicit[:, :active_rank] @ u_explicit[:, :active_rank].T
+    u_projector_matfree = u_matfree[:, :active_rank] @ u_matfree[:, :active_rank].T
+    vh_basis_explicit = vh_explicit[:active_rank, :].T
+    vh_basis_matfree = vh_matfree[:active_rank, :].T
+    vh_projector_explicit = vh_basis_explicit @ vh_basis_explicit.T
+    vh_projector_matfree = vh_basis_matfree @ vh_basis_matfree.T
+
+    np.testing.assert_allclose(
+        u_projector_matfree, u_projector_explicit, rtol=1e-4, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        vh_projector_matfree, vh_projector_explicit, rtol=1e-4, atol=1e-4
+    )
+
+    explicit_update = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u_explicit,
+        s_explicit,
+        vh_explicit,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        rank_update_max=svd_working_rank,
+    )
+    matfree_update = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u_matfree,
+        s_matfree,
+        vh_matfree,
+        damping=0.05,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        rank_update_max=svd_working_rank,
+    )
+    np.testing.assert_allclose(
+        matfree_update.grad_like_update,
+        explicit_update.grad_like_update,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_right_warm_start_svd_matfree_matches_explicit_initial_branch():
+    params = _tiny_params()
+    positions = _tiny_positions()
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=jnp.array(
+            [
+                [1.0, -2.0, 30.0, -40.0, 50.0],
+                [0.5, 1.5, -50.0, 20.0, -10.0],
+                [-1.0, 0.25, 70.0, -80.0, 90.0],
+            ]
+        ),
+        ek=jnp.array([0.2, -0.1, 10.0, -20.0, 30.0]),
+        sr_rank0=jnp.array(0),
+        sr_rank=jnp.array(2),
+        u=jnp.zeros((3, 5)),
+        has_u=jnp.array(False),
+    )
+
+    assert positions.shape[0] > jax.flatten_util.ravel_pytree(params)[0].shape[0]
+    _assert_right_warm_start_svd_matfree_matches_explicit(
+        _log_psi_apply,
+        params,
+        positions,
+        state,
+        eta=0.99,
+        key=jax.random.PRNGKey(21),
+        svd_working_rank=2,
+        maxiter_initial=2,
+        maxiter_warm=1,
+    )
+
+
+def test_right_warm_start_svd_matfree_matches_explicit_warm_branch_with_history():
+    params = {
+        "w": jnp.array([[0.2, -0.1, 0.3], [0.7, -0.4, 0.5]]),
+        "b": jnp.array([0.1, -0.2]),
+        "scale": jnp.array(0.4),
+    }
+    positions = jnp.array(
+        [
+            [0.5, -1.0, 0.25],
+            [1.5, 0.2, -0.75],
+            [-0.25, 0.4, 1.0],
+        ]
+    )
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=jnp.array(
+            [
+                [0.5, -1.0, 10.0, 20.0, -30.0],
+                [1.5, 0.25, -10.0, 40.0, 50.0],
+                [-0.5, 0.75, 60.0, -70.0, 80.0],
+                [0.2, -0.4, -90.0, 100.0, 110.0],
+                [1.2, 0.8, 120.0, 130.0, -140.0],
+                [-1.1, 0.3, 150.0, -160.0, 170.0],
+                [0.9, -0.7, -180.0, 190.0, 200.0],
+                [0.4, 1.4, 210.0, -220.0, 230.0],
+                [-0.8, 0.6, -240.0, 250.0, -260.0],
+            ]
+        ),
+        ek=jnp.array([0.3, -0.2, 100.0, 200.0, -300.0]),
+        sr_rank0=jnp.array(2),
+        sr_rank=jnp.array(3),
+        u=jnp.eye(9, 5),
+        has_u=jnp.array(True),
+    )
+
+    def log_psi_apply(params, position):
+        hidden = jnp.tanh(params["w"] @ position + params["b"])
+        return jnp.sum(hidden) + params["scale"] * jnp.prod(position)
+
+    assert state.sr_o.shape[1] > int(state.sr_rank0)
+    assert jax.flatten_util.ravel_pytree(params)[0].shape[0] > positions.shape[0]
+    _assert_right_warm_start_svd_matfree_matches_explicit(
+        log_psi_apply,
+        params,
+        positions,
+        state,
+        eta=0.99,
+        key=jax.random.PRNGKey(22),
+        svd_working_rank=3,
+        maxiter_initial=2,
+        maxiter_warm=1,
+    )
+
+
 def test_wssr_warm_svd_right_matches_exact_svd_on_small_rank_controlled_case():
     state = wssr.initialize_wssr_warm_svd_core_state(
         num_params=4,

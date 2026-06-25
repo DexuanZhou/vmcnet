@@ -232,6 +232,42 @@ def wssr_augmented_rmatvec(
     return jnp.concatenate([history_term, current_term], axis=0)
 
 
+def wssr_augmented_matmat(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    aug_matrix: Array,
+) -> Array:
+    """Compute ``O_aug @ aug_matrix`` without materializing current scores."""
+    return jax.vmap(
+        lambda aug_vector: wssr_augmented_matvec(
+            log_psi_apply, params, positions, state, eta, aug_vector
+        ),
+        in_axes=1,
+        out_axes=1,
+    )(aug_matrix)
+
+
+def wssr_augmented_rmatmat(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    param_matrix: Array,
+) -> Array:
+    """Compute ``O_aug.T @ param_matrix`` without materializing current scores."""
+    return jax.vmap(
+        lambda param_vector: wssr_augmented_rmatvec(
+            log_psi_apply, params, positions, state, eta, param_vector
+        ),
+        in_axes=1,
+        out_axes=1,
+    )(param_matrix)
+
+
 def center_and_scale_energy_residuals(local_energies: Array, energy: Array) -> Array:
     """Center local-energy residuals and apply Julia WSSR scaling."""
     residuals = local_energies - energy
@@ -790,6 +826,101 @@ def right_warm_start_svd(
 
     v = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
     y = o_aug @ v
+    gram = y.T @ y
+    eigvals, right_rot = jnp.linalg.eigh(gram)
+    order = jnp.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    right_rot = right_rot[:, order]
+    singular_values = jnp.sqrt(jnp.maximum(eigvals, 0.0)) * rank_mask
+
+    safe_singular_values = jnp.where(singular_values > eps, singular_values, 1.0)
+    u = (y @ right_rot) / safe_singular_values
+    u = u * rank_mask
+    vh = (v @ right_rot).T * rank_mask[:, None]
+    return u, singular_values, vh, rank
+
+
+def right_warm_start_svd_matfree(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    state: WSSRWarmSVDCoreState,
+    eta: chex.Numeric,
+    key: Array,
+    maxiter_initial: int,
+    maxiter_warm: int,
+    svd_working_rank: Optional[int] = None,
+    eps: chex.Numeric = 1e-12,
+) -> Tuple[Array, Array, Array, Array]:
+    """Matrix-free analogue of :func:`right_warm_start_svd`.
+
+    This prototype uses semi-matrix-free augmented products. The history block is
+    explicit in ``state.sr_o``; the current score block is applied via JVP/VJP
+    without materializing ``O_cur`` or ``O_aug``.
+    """
+    if maxiter_initial < 0:
+        raise ValueError("maxiter_initial must be nonnegative")
+    if maxiter_warm < 0:
+        raise ValueError("maxiter_warm must be nonnegative")
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    num_params = flat_params.shape[0]
+    aug_width = state.sr_o.shape[1] + positions.shape[0]
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    rank_capacity = min(
+        working_rank_max,
+        state.u.shape[1],
+        num_params,
+        aug_width,
+    )
+    if rank_capacity == 0:
+        return (
+            jnp.zeros((num_params, 0), dtype=flat_params.dtype),
+            jnp.zeros((0,), dtype=flat_params.dtype),
+            jnp.zeros((0, aug_width), dtype=flat_params.dtype),
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
+
+    rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_capacity, dtype=state.sr_rank.dtype),
+    )
+    rank_mask = (jnp.arange(rank_capacity) < rank).astype(flat_params.dtype)
+
+    def _masked_qr(z):
+        q, _ = jnp.linalg.qr(z, mode="reduced")
+        return q * rank_mask
+
+    def _matmat(v):
+        return wssr_augmented_matmat(
+            log_psi_apply, params, positions, state, eta, v
+        )
+
+    def _rmatmat(y):
+        return wssr_augmented_rmatmat(
+            log_psi_apply, params, positions, state, eta, y
+        )
+
+    def _subspace_iterate(v, n_iter):
+        for _ in range(n_iter):
+            y = _matmat(v)
+            z = _rmatmat(y)
+            v = _masked_qr(z)
+        return v
+
+    def _warm_branch(_):
+        u0 = state.u[:, :rank_capacity] * rank_mask
+        v = _masked_qr(_rmatmat(u0))
+        return _subspace_iterate(v, maxiter_warm)
+
+    def _initial_branch(_):
+        omega = jax.random.normal(key, (aug_width, rank_capacity), dtype=flat_params.dtype)
+        omega = omega * rank_mask
+        v = _masked_qr(omega)
+        return _subspace_iterate(v, maxiter_initial)
+
+    v = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
+    y = _matmat(v)
     gram = y.T @ y
     eigvals, right_rot = jnp.linalg.eigh(gram)
     order = jnp.argsort(eigvals)[::-1]
