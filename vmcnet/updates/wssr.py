@@ -274,6 +274,28 @@ def center_and_scale_energy_residuals(local_energies: Array, energy: Array) -> A
     return residuals / jnp.sqrt(local_energies.shape[0])
 
 
+def augment_wssr_residuals(
+    e_cur: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+) -> Array:
+    """Create the history-augmented WSSR residual vector only.
+
+    This matches the residual side of :func:`augment_wssr_system` without
+    requiring an explicit current score matrix.
+    """
+    history_width = state.sr_o.shape[1]
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(e_cur.dtype)
+    has_history = state.sr_rank0 > 0
+    sqrt_eta = jnp.sqrt(eta)
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        e_cur.dtype
+    )
+    e_hist = sqrt_eta * state.ek * history_mask
+    e_scaled = current_scale * e_cur
+    return jnp.concatenate([e_hist, e_scaled], axis=0)
+
+
 def augment_wssr_system(
     o_cur: Array,
     e_cur: Array,
@@ -430,6 +452,100 @@ def _wssr_update_from_svd(
     safe_damping = jnp.maximum(jnp.abs(damping), eps)
     sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(safe_leading_sv))
     force = o_aug @ e_aug
+    projected_force = u.T @ force
+    projected_force = projected_force * (
+        jnp.square(1.0 / safe_singular_values) - sigma0
+    )
+    projected_force = projected_force * retained_float
+    grad_like_update = u @ projected_force + sigma0 * force
+    grad_like_update = jnp.where(valid_update, grad_like_update, 0.0)
+
+    if constrain_update_norm:
+        grad_like_update = constrain_norm(grad_like_update, norm_constraint, eps=eps)
+
+    sr_o = jnp.zeros_like(state.sr_o)
+    ek = jnp.zeros_like(state.ek)
+    history_width = min(singular_values.shape[0], sr_rank_max)
+    sr_o_values = (
+        u[:, :history_width]
+        * singular_values[:history_width]
+        * retained_float[:history_width]
+    )
+    ek_values = (vh[:history_width, :] @ e_aug) * retained_float[:history_width]
+    sr_o = sr_o.at[:, :history_width].set(sr_o_values)
+    ek = ek.at[:history_width].set(ek_values)
+
+    updated_sr_rank = _update_working_rank(
+        active_rank, state.sr_rank, rank_update_max, sr_scale
+    )
+    capped_sr_rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_update_max, dtype=state.sr_rank.dtype),
+    )
+    new_sr_rank = jnp.where(valid_update, updated_sr_rank, capped_sr_rank)
+    new_state = WSSRCoreState(
+        sr_o=jnp.where(valid_update, sr_o, jnp.zeros_like(sr_o)),
+        ek=jnp.where(valid_update, ek, jnp.zeros_like(ek)),
+        sr_rank0=jnp.where(
+            valid_update, active_rank, jnp.asarray(0, dtype=state.sr_rank0.dtype)
+        ),
+        sr_rank=new_sr_rank,
+    )
+    return WSSRSVDResult(grad_like_update, new_state, active_rank)
+
+
+def _wssr_update_from_svd_matfree(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    e_aug: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    u: Array,
+    singular_values: Array,
+    vh: Array,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric,
+    constrain_update_norm: bool,
+    rank_update_max: Optional[int] = None,
+    eps: chex.Numeric = 1e-12,
+) -> WSSRSVDResult:
+    """Matrix-free analogue of :func:`_wssr_update_from_svd`."""
+    if rank_update_max is None:
+        rank_update_max = sr_rank_max
+    rank_update_max = min(rank_update_max, sr_rank_max)
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    if singular_values.shape[0] == 0:
+        zero_state = _zero_history_like(state)
+        return WSSRSVDResult(
+            jnp.zeros(flat_params.shape[0], dtype=flat_params.dtype),
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+        )
+
+    leading_sv = singular_values[0]
+    valid_leading = leading_sv > eps
+    safe_leading_sv = jnp.where(valid_leading, leading_sv, 1.0)
+    retained = (singular_values / safe_leading_sv > damping) & valid_leading
+    active_rank = jnp.sum(retained.astype(state.sr_rank.dtype))
+    has_active_rank = active_rank > 0
+    valid_update = valid_leading & has_active_rank
+    retained_float = retained.astype(flat_params.dtype)
+
+    safe_singular_values = jnp.where(retained, singular_values, 1.0)
+    safe_damping = jnp.maximum(jnp.abs(damping), eps)
+    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(safe_leading_sv))
+    force = wssr_augmented_matvec(
+        log_psi_apply,
+        params,
+        positions,
+        state,
+        eta,
+        e_aug,
+    )
     projected_force = u.T @ force
     projected_force = projected_force * (
         jnp.square(1.0 / safe_singular_values) - sigma0
@@ -1238,6 +1354,72 @@ def compute_wssr_warm_svd_right_core_update(
         constrain_update_norm=constrain_update_norm,
     )
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
+
+
+def compute_wssr_warm_svd_right_core_update_matfree(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    local_energies: Array,
+    energy: Array,
+    state: WSSRWarmSVDCoreState,
+    key: Array,
+    eta: chex.Numeric,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    svd_maxiter_initial: int = 8,
+    svd_maxiter_warm: int = 2,
+    svd_working_rank: Optional[int] = None,
+    constrain_update_norm: bool = True,
+) -> Tuple[P, WSSRWarmSVDCoreState, int]:
+    """Matrix-free right-subspace warm-start SVD WSSR core update."""
+    _, unravel_fn = jax.flatten_util.ravel_pytree(params)
+    e_cur = center_and_scale_energy_residuals(local_energies, energy)
+    e_aug = augment_wssr_residuals(e_cur, state, eta)
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, sr_rank_max)
+    u, singular_values, vh, rank = right_warm_start_svd_matfree(
+        log_psi_apply,
+        params,
+        positions,
+        state,
+        eta,
+        key,
+        svd_maxiter_initial,
+        svd_maxiter_warm,
+        svd_working_rank=working_rank_max,
+    )
+    result = _wssr_update_from_svd_matfree(
+        log_psi_apply,
+        params,
+        positions,
+        e_aug,
+        state,
+        eta,
+        u,
+        singular_values,
+        vh,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale,
+        constrain_update_norm,
+        rank_update_max=working_rank_max,
+    )
+    u_state = jnp.zeros_like(state.u)
+    warm_width = min(u.shape[1], state.u.shape[1])
+    rank_mask = (jnp.arange(warm_width) < rank).astype(u.dtype)
+    u_state = u_state.at[:, :warm_width].set(u[:, :warm_width] * rank_mask)
+    warm_state = WSSRWarmSVDCoreState(
+        sr_o=result.state.sr_o,
+        ek=result.state.ek,
+        sr_rank0=result.state.sr_rank0,
+        sr_rank=result.state.sr_rank,
+        u=u_state,
+        has_u=jnp.where(rank > 0, jnp.array(True), state.has_u),
+    )
+    return unravel_fn(result.grad_like_update), warm_state, result.active_rank
 
 
 def construct_wssr_svd_update_param_fn(
