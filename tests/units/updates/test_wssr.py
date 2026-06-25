@@ -59,6 +59,25 @@ def _assert_wssr_state_all_finite(state):
         assert jnp.all(jnp.isfinite(state.has_u))
 
 
+_WSSR_RANK_METRIC_KEYS = {
+    "wssr_active_rank",
+    "wssr_sr_rank",
+    "wssr_sr_rank0",
+    "wssr_storage_width",
+    "wssr_svd_working_rank",
+    "wssr_sr_rank_max",
+}
+
+
+def _assert_wssr_rank_metrics(metrics, sr_rank_max, svd_working_rank):
+    assert set(metrics).issuperset(_WSSR_RANK_METRIC_KEYS)
+    assert metrics["wssr_storage_width"] == jnp.asarray(sr_rank_max)
+    assert metrics["wssr_sr_rank_max"] == jnp.asarray(sr_rank_max)
+    assert metrics["wssr_svd_working_rank"] == jnp.asarray(svd_working_rank)
+    assert 0 <= metrics["wssr_active_rank"] <= metrics["wssr_svd_working_rank"]
+    assert 0 <= metrics["wssr_sr_rank0"] <= metrics["wssr_sr_rank"]
+
+
 def _legacy_dynamic_augment_wssr_system(o_cur, e_cur, state, eta):
     active_rank = int(state.sr_rank0)
     if active_rank == 0:
@@ -2247,6 +2266,41 @@ def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_stat
     assert not hasattr(optimizer_state.core_state, "v")
     assert optimizer_state.core_state.has_u == jnp.array(False)
     assert key.shape == (2,)
+
+
+def test_wssr_warm_svd_right_update_returns_rank_diagnostics():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    config.vmc.optimizer.wssr_warm_svd_right.schedule_type = "constant"
+    config.vmc.optimizer.wssr_warm_svd_right.constrain_norm = False
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 2
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 5
+    config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 3
+    config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial = 2
+    config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm = 1
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(5),
+        apply_pmap=False,
+    )
+    _, _, _, metrics, _ = update_param_fn(params, data, optimizer_state, key)
+
+    _assert_wssr_rank_metrics(
+        metrics,
+        sr_rank_max=config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max,
+        svd_working_rank=config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank,
+    )
 
 
 def test_initialize_optimizer_dispatches_wssr_warm_svd_right_matfree_and_constructs_state():

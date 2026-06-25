@@ -452,6 +452,37 @@ def _resolve_svd_working_rank(
     return min(svd_working_rank, sr_rank_max)
 
 
+def _update_metrics_with_wssr_rank_diagnostics(
+    metrics,
+    active_rank: Array,
+    core_state: WSSRCoreState,
+    optimizer_config: ConfigDict,
+    svd_working_rank: Optional[int] = None,
+):
+    """Add WSSR rank/storage diagnostics to an update metrics dictionary."""
+    resolved_working_rank = _resolve_svd_working_rank(
+        svd_working_rank, optimizer_config.sr_rank_max
+    )
+    metric_dtype = core_state.sr_rank.dtype
+    metrics.update(
+        {
+            "wssr_active_rank": jnp.asarray(active_rank, dtype=metric_dtype),
+            "wssr_sr_rank": core_state.sr_rank,
+            "wssr_sr_rank0": core_state.sr_rank0,
+            "wssr_storage_width": jnp.asarray(
+                core_state.sr_o.shape[1], dtype=metric_dtype
+            ),
+            "wssr_svd_working_rank": jnp.asarray(
+                resolved_working_rank, dtype=metric_dtype
+            ),
+            "wssr_sr_rank_max": jnp.asarray(
+                optimizer_config.sr_rank_max, dtype=metric_dtype
+            ),
+        }
+    )
+    return metrics
+
+
 def _update_working_rank(active_rank: Array, sr_rank: Array, sr_rank_max: int, sr_scale):
     capped_sr_rank = jnp.minimum(
         sr_rank,
@@ -1521,7 +1552,7 @@ def construct_wssr_svd_update_param_fn(
         position = get_position_fn(data)
         energy, local_energies, stats = energy_and_statistics_fn(params, position)
 
-        grad_like_update, core_state, _ = compute_wssr_svd_core_update(
+        grad_like_update, core_state, active_rank = compute_wssr_svd_core_update(
             log_psi_apply,
             params,
             position,
@@ -1551,6 +1582,9 @@ def construct_wssr_svd_update_param_fn(
             stats["energy_noclip"],
             stats["variance_noclip"],
             metrics,
+        )
+        metrics = _update_metrics_with_wssr_rank_diagnostics(
+            metrics, active_rank, core_state, optimizer_config
         )
         if record_param_l1_norm:
             metrics.update({"param_l1_norm": tree_reduce_l1(params)})
@@ -1582,7 +1616,7 @@ def construct_wssr_sketch_update_param_fn(
         energy, local_energies, stats = energy_and_statistics_fn(params, position)
         key, sketch_key = jax.random.split(key)
 
-        grad_like_update, core_state, _ = compute_wssr_sketch_core_update(
+        grad_like_update, core_state, active_rank = compute_wssr_sketch_core_update(
             log_psi_apply,
             params,
             position,
@@ -1616,6 +1650,9 @@ def construct_wssr_sketch_update_param_fn(
             stats["variance_noclip"],
             metrics,
         )
+        metrics = _update_metrics_with_wssr_rank_diagnostics(
+            metrics, active_rank, core_state, optimizer_config
+        )
         if record_param_l1_norm:
             metrics.update({"param_l1_norm": tree_reduce_l1(params)})
 
@@ -1646,7 +1683,7 @@ def construct_wssr_warm_svd_update_param_fn(
         energy, local_energies, stats = energy_and_statistics_fn(params, position)
         key, svd_key = jax.random.split(key)
 
-        grad_like_update, core_state, _ = compute_wssr_warm_svd_core_update(
+        grad_like_update, core_state, active_rank = compute_wssr_warm_svd_core_update(
             log_psi_apply,
             params,
             position,
@@ -1680,6 +1717,13 @@ def construct_wssr_warm_svd_update_param_fn(
             stats["energy_noclip"],
             stats["variance_noclip"],
             metrics,
+        )
+        metrics = _update_metrics_with_wssr_rank_diagnostics(
+            metrics,
+            active_rank,
+            core_state,
+            optimizer_config,
+            svd_working_rank=optimizer_config.get("svd_working_rank", None),
         )
         if record_param_l1_norm:
             metrics.update({"param_l1_norm": tree_reduce_l1(params)})
@@ -1711,23 +1755,25 @@ def construct_wssr_warm_svd_right_update_param_fn(
         energy, local_energies, stats = energy_and_statistics_fn(params, position)
         key, svd_key = jax.random.split(key)
 
-        grad_like_update, core_state, _ = compute_wssr_warm_svd_right_core_update(
-            log_psi_apply,
-            params,
-            position,
-            local_energies,
-            energy,
-            optimizer_state.core_state,
-            svd_key,
-            optimizer_config.eta,
-            optimizer_config.damping,
-            optimizer_config.norm_constraint,
-            optimizer_config.sr_rank_max,
-            sr_scale=optimizer_config.sr_scale,
-            svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
-            svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
-            svd_working_rank=optimizer_config.get("svd_working_rank", None),
-            constrain_update_norm=False,
+        grad_like_update, core_state, active_rank = (
+            compute_wssr_warm_svd_right_core_update(
+                log_psi_apply,
+                params,
+                position,
+                local_energies,
+                energy,
+                optimizer_state.core_state,
+                svd_key,
+                optimizer_config.eta,
+                optimizer_config.damping,
+                optimizer_config.norm_constraint,
+                optimizer_config.sr_rank_max,
+                sr_scale=optimizer_config.sr_scale,
+                svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
+                svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
+                svd_working_rank=optimizer_config.get("svd_working_rank", None),
+                constrain_update_norm=False,
+            )
         )
 
         updates, optax_state = optimizer.update(
@@ -1745,6 +1791,13 @@ def construct_wssr_warm_svd_right_update_param_fn(
             stats["energy_noclip"],
             stats["variance_noclip"],
             metrics,
+        )
+        metrics = _update_metrics_with_wssr_rank_diagnostics(
+            metrics,
+            active_rank,
+            core_state,
+            optimizer_config,
+            svd_working_rank=optimizer_config.get("svd_working_rank", None),
         )
         if record_param_l1_norm:
             metrics.update({"param_l1_norm": tree_reduce_l1(params)})
@@ -1776,7 +1829,7 @@ def construct_wssr_warm_svd_right_matfree_update_param_fn(
         energy, local_energies, stats = energy_and_statistics_fn(params, position)
         key, svd_key = jax.random.split(key)
 
-        grad_like_update, core_state, _ = (
+        grad_like_update, core_state, active_rank = (
             compute_wssr_warm_svd_right_core_update_matfree(
                 log_psi_apply,
                 params,
@@ -1812,6 +1865,13 @@ def construct_wssr_warm_svd_right_matfree_update_param_fn(
             stats["energy_noclip"],
             stats["variance_noclip"],
             metrics,
+        )
+        metrics = _update_metrics_with_wssr_rank_diagnostics(
+            metrics,
+            active_rank,
+            core_state,
+            optimizer_config,
+            svd_working_rank=optimizer_config.get("svd_working_rank", None),
         )
         if record_param_l1_norm:
             metrics.update({"param_l1_norm": tree_reduce_l1(params)})
