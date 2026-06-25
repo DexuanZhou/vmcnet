@@ -113,6 +113,26 @@ def test_parse_config_accepts_wssr_warm_svd_right_optimizer_type(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_overrides_wssr_warm_svd_right_storage_rank(mocker):
+    """Test command-line override for right WSSR storage allocation width."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        [
+            "vmcnet",
+            "--config.vmc.optimizer_type=wssr_warm_svd_right",
+            "--config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank=80",
+        ],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_warm_svd_right"
+    expected_config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank = 80
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_parse_config_accepts_wssr_warm_svd_right_matfree_optimizer_type(mocker):
     """Test that the matrix-free right WSSR optimizer is a visible option."""
     flag_values = flags.FlagValues()
@@ -140,6 +160,7 @@ def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.damping=0.005",
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank=12",
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max=80",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_storage_rank=40",
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank=24",
         ],
     )
@@ -149,6 +170,7 @@ def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
     expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.damping = 0.005
     expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank = 12
     expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max = 80
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_storage_rank = 40
     expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank = 24
 
     _, config = parse_flags(flag_values)

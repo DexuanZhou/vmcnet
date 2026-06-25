@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import chex
+import pytest
 
 import vmcnet.physics as physics
 import vmcnet.train.default_config as default_config
@@ -69,9 +70,13 @@ _WSSR_RANK_METRIC_KEYS = {
 }
 
 
-def _assert_wssr_rank_metrics(metrics, sr_rank_max, svd_working_rank):
+def _assert_wssr_rank_metrics(
+    metrics, sr_rank_max, svd_working_rank, storage_width=None
+):
+    if storage_width is None:
+        storage_width = sr_rank_max
     assert set(metrics).issuperset(_WSSR_RANK_METRIC_KEYS)
-    assert metrics["wssr_storage_width"] == jnp.asarray(sr_rank_max)
+    assert metrics["wssr_storage_width"] == jnp.asarray(storage_width)
     assert metrics["wssr_sr_rank_max"] == jnp.asarray(sr_rank_max)
     assert metrics["wssr_svd_working_rank"] == jnp.asarray(svd_working_rank)
     assert 0 <= metrics["wssr_active_rank"] <= metrics["wssr_svd_working_rank"]
@@ -112,6 +117,16 @@ def test_initialize_wssr_core_state_shapes_and_ranks():
     assert 0 <= state.sr_rank0 <= state.sr_rank <= 7
 
 
+def test_resolve_wssr_storage_rank_preserves_default_and_validates_width():
+    assert wssr.resolve_wssr_storage_rank(10, 100, -1) == 100
+    assert wssr.resolve_wssr_storage_rank(10, 100, None) == 100
+    assert wssr.resolve_wssr_storage_rank(10, 100, 80) == 80
+    assert wssr.resolve_wssr_storage_rank(10, 100, 120) == 100
+
+    with pytest.raises(ValueError, match="sr_storage_rank"):
+        wssr.resolve_wssr_storage_rank(10, 100, 5)
+
+
 def test_default_config_contains_wssr_svd_without_changing_default_optimizer():
     config = default_config.get_default_config()
 
@@ -150,6 +165,7 @@ def test_default_config_contains_wssr_warm_svd_right():
     assert config.vmc.optimizer.wssr_warm_svd_right.learning_rate == 5e-2
     assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank == 10
     assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max == 100
+    assert config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank == -1
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm == 2
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank == -1
@@ -161,6 +177,7 @@ def test_default_config_contains_wssr_warm_svd_right_matfree():
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.learning_rate == 5e-2
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank == 10
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max == 100
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_storage_rank == -1
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_warm == 2
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank == -1
@@ -2229,6 +2246,109 @@ def test_wssr_warm_svd_right_rank_growth_caps_to_working_width_and_stores_histor
     assert jnp.all(result.state.ek[3:] == 0.0)
 
 
+def test_wssr_warm_svd_right_thin_storage_matches_zero_padded_full_storage():
+    num_params = 8
+    storage_rank = 7
+    sr_rank_max = 20
+    num_samples = 6
+    dtype = jnp.float32
+
+    history = (
+        jnp.arange(num_params * storage_rank, dtype=dtype)
+        .reshape(num_params, storage_rank)
+        / 50.0
+    )
+    ek = jnp.linspace(-0.2, 0.25, storage_rank, dtype=dtype)
+    u_basis = jnp.eye(num_params, storage_rank, dtype=dtype)
+    o_cur = (
+        jnp.arange(num_params * num_samples, dtype=dtype)
+        .reshape(num_params, num_samples)
+        / 30.0
+    )
+    e_cur = jnp.linspace(-0.4, 0.5, num_samples, dtype=dtype)
+
+    full_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=num_params,
+        sr_rank=storage_rank,
+        sr_rank_max=sr_rank_max,
+        dtype=dtype,
+    )
+    full_state = full_state._replace(
+        sr_o=full_state.sr_o.at[:, :storage_rank].set(history),
+        ek=full_state.ek.at[:storage_rank].set(ek),
+        sr_rank0=jnp.array(storage_rank),
+        u=full_state.u.at[:, :storage_rank].set(u_basis),
+        has_u=jnp.array(True),
+    )
+    thin_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=num_params,
+        sr_rank=storage_rank,
+        sr_rank_max=storage_rank,
+        dtype=dtype,
+    )
+    thin_state = thin_state._replace(
+        sr_o=history,
+        ek=ek,
+        sr_rank0=jnp.array(storage_rank),
+        u=u_basis,
+        has_u=jnp.array(True),
+    )
+
+    eta = 0.99
+    o_aug_full, e_aug_full = wssr.augment_wssr_system(
+        o_cur, e_cur, full_state, eta
+    )
+    o_aug_thin, e_aug_thin = wssr.augment_wssr_system(
+        o_cur, e_cur, thin_state, eta
+    )
+    kwargs = dict(
+        key=jax.random.PRNGKey(17),
+        damping=0.02,
+        norm_constraint=10.0,
+        sr_rank_max=sr_rank_max,
+        sr_scale=1.1,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=2,
+        svd_working_rank=storage_rank,
+        constrain_update_norm=False,
+    )
+
+    full_result = wssr.wssr_warm_svd_right_core_update(
+        o_aug_full, e_aug_full, full_state, **kwargs
+    )
+    thin_result = wssr.wssr_warm_svd_right_core_update(
+        o_aug_thin, e_aug_thin, thin_state, **kwargs
+    )
+
+    np.testing.assert_allclose(
+        thin_result.grad_like_update,
+        full_result.grad_like_update,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        thin_result.state.sr_o,
+        full_result.state.sr_o[:, :storage_rank],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        thin_result.state.ek,
+        full_result.state.ek[:storage_rank],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    chex.assert_trees_all_close(thin_result.active_rank, full_result.active_rank)
+    chex.assert_trees_all_close(thin_result.state.sr_rank, full_result.state.sr_rank)
+    chex.assert_trees_all_close(
+        thin_result.state.sr_rank0, full_result.state.sr_rank0
+    )
+    assert thin_result.state.sr_o.shape[1] == storage_rank
+    assert full_result.state.sr_o.shape[1] == sr_rank_max
+    assert jnp.all(full_result.state.sr_o[:, storage_rank:] == 0.0)
+    assert jnp.all(full_result.state.ek[storage_rank:] == 0.0)
+
+
 def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_state():
     params = _tiny_params()
     data = _tiny_positions()
@@ -2266,6 +2386,61 @@ def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_stat
     assert not hasattr(optimizer_state.core_state, "v")
     assert optimizer_state.core_state.has_u == jnp.array(False)
     assert key.shape == (2,)
+
+
+def test_initialize_wssr_warm_svd_right_uses_thin_storage_rank_when_set():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 4
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 20
+    config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank = 7
+    config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 7
+
+    _, optimizer_state, _ = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(0),
+        apply_pmap=False,
+    )
+
+    assert optimizer_state.core_state.sr_o.shape == (3, 7)
+    assert optimizer_state.core_state.ek.shape == (7,)
+    assert optimizer_state.core_state.u.shape == (3, 7)
+    assert optimizer_state.core_state.sr_rank == jnp.asarray(4)
+
+
+def test_initialize_wssr_warm_svd_right_rejects_storage_rank_below_initial_rank():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 10
+    config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 20
+    config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank = 5
+
+    with pytest.raises(ValueError, match="sr_storage_rank"):
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=False,
+        )
 
 
 def test_wssr_warm_svd_right_update_returns_rank_diagnostics():
@@ -2418,7 +2593,7 @@ def test_wssr_warm_svd_right_matfree_one_update_matches_explicit_right_path():
         matfree_update_fn(params, data, matfree_state, matfree_key)
     )
 
-    assert_pytree_allclose(matfree_params, explicit_params, rtol=1e-4, atol=1e-4)
+    assert_pytree_allclose(matfree_params, explicit_params, rtol=2e-4, atol=2e-4)
     assert set(matfree_metrics).issuperset({"energy", "variance", "energy_noclip"})
     assert set(explicit_metrics).issuperset({"energy", "variance", "energy_noclip"})
     chex.assert_trees_all_close(

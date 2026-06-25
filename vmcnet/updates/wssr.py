@@ -452,6 +452,28 @@ def _resolve_svd_working_rank(
     return min(svd_working_rank, sr_rank_max)
 
 
+def resolve_wssr_storage_rank(
+    sr_rank: int,
+    sr_rank_max: int,
+    sr_storage_rank: Optional[int] = None,
+) -> int:
+    """Resolve the fixed WSSR history allocation width.
+
+    ``sr_rank_max`` remains the logical maximum rank used by optimizer configs and
+    diagnostics. ``sr_storage_rank`` optionally narrows the allocated history and
+    warm-start buffers. Nonpositive values preserve the historical full-width
+    allocation.
+    """
+    if sr_storage_rank is None or sr_storage_rank <= 0:
+        storage_rank = sr_rank_max
+    else:
+        storage_rank = min(sr_storage_rank, sr_rank_max)
+
+    if storage_rank < sr_rank:
+        raise ValueError("sr_storage_rank must be at least sr_rank")
+    return storage_rank
+
+
 def _update_metrics_with_wssr_rank_diagnostics(
     metrics,
     active_rank: Array,
@@ -463,6 +485,7 @@ def _update_metrics_with_wssr_rank_diagnostics(
     resolved_working_rank = _resolve_svd_working_rank(
         svd_working_rank, optimizer_config.sr_rank_max
     )
+    resolved_working_rank = min(resolved_working_rank, core_state.sr_o.shape[1])
     metric_dtype = core_state.sr_rank.dtype
     metrics.update(
         {
@@ -1247,7 +1270,8 @@ def wssr_warm_svd_right_core_update(
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Compute one right-subspace warm-start SVD WSSR core update."""
-    if sr_rank_max == 0:
+    storage_rank_max = min(sr_rank_max, state.sr_o.shape[1])
+    if storage_rank_max == 0:
         zero_state = _zero_warm_svd_history_like(state)
         return WSSRSVDResult(
             jnp.zeros(o_aug.shape[0], dtype=o_aug.dtype),
@@ -1256,6 +1280,7 @@ def wssr_warm_svd_right_core_update(
         )
 
     working_rank_max = _resolve_svd_working_rank(svd_working_rank, sr_rank_max)
+    working_rank_max = min(working_rank_max, storage_rank_max)
     u, singular_values, vh, rank = right_warm_start_svd(
         o_aug,
         state,
@@ -1274,7 +1299,7 @@ def wssr_warm_svd_right_core_update(
         vh,
         damping,
         norm_constraint,
-        sr_rank_max,
+        storage_rank_max,
         sr_scale,
         constrain_update_norm,
         rank_update_max=working_rank_max,
@@ -1483,7 +1508,9 @@ def compute_wssr_warm_svd_right_core_update_matfree(
     _, unravel_fn = jax.flatten_util.ravel_pytree(params)
     e_cur = center_and_scale_energy_residuals(local_energies, energy)
     e_aug = augment_wssr_residuals(e_cur, state, eta)
+    storage_rank_max = min(sr_rank_max, state.sr_o.shape[1])
     working_rank_max = _resolve_svd_working_rank(svd_working_rank, sr_rank_max)
+    working_rank_max = min(working_rank_max, storage_rank_max)
     u, singular_values, vh, rank = right_warm_start_svd_matfree(
         log_psi_apply,
         params,
@@ -1507,7 +1534,7 @@ def compute_wssr_warm_svd_right_core_update_matfree(
         vh,
         damping,
         norm_constraint,
-        sr_rank_max,
+        storage_rank_max,
         sr_scale,
         constrain_update_norm,
         rank_update_max=working_rank_max,
@@ -1946,10 +1973,15 @@ def initialize_wssr_warm_svd_right_matfree(
         )
 
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    storage_rank = resolve_wssr_storage_rank(
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        optimizer_config.get("sr_storage_rank", -1),
+    )
     core_state = initialize_wssr_warm_svd_core_state(
         flat_params.shape[0],
         optimizer_config.sr_rank,
-        optimizer_config.sr_rank_max,
+        storage_rank,
         dtype=flat_params.dtype,
     )
     optimizer = optax.sgd(
@@ -2073,10 +2105,15 @@ def initialize_wssr_warm_svd_right(
         )
 
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    storage_rank = resolve_wssr_storage_rank(
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        optimizer_config.get("sr_storage_rank", -1),
+    )
     core_state = initialize_wssr_warm_svd_core_state(
         flat_params.shape[0],
         optimizer_config.sr_rank,
-        optimizer_config.sr_rank_max,
+        storage_rank,
         dtype=flat_params.dtype,
     )
     optimizer = optax.sgd(
