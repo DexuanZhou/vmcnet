@@ -240,6 +240,92 @@ def test_matrix_free_score_products_match_explicit_when_params_exceed_samples():
     )
 
 
+def _assert_augmented_matrix_free_products_match_explicit(
+    log_psi_apply, params, positions, state, eta
+):
+    o_cur, _ = wssr.center_and_scale_score_matrix(log_psi_apply, params, positions)
+    e_cur = jnp.linspace(-0.2, 0.4, positions.shape[0])
+    o_aug, _ = wssr.augment_wssr_system(o_cur, e_cur, state, eta)
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    aug_vector = jnp.linspace(-0.8, 1.1, state.sr_o.shape[1] + positions.shape[0])
+    param_vector = jnp.linspace(0.7, -0.9, flat_params.shape[0])
+
+    matvec = wssr.wssr_augmented_matvec(
+        log_psi_apply, params, positions, state, eta, aug_vector
+    )
+    rmatvec = wssr.wssr_augmented_rmatvec(
+        log_psi_apply, params, positions, state, eta, param_vector
+    )
+
+    np.testing.assert_allclose(matvec, o_aug @ aug_vector, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(rmatvec, o_aug.T @ param_vector, rtol=1e-5, atol=1e-5)
+
+
+def test_augmented_matrix_free_products_match_explicit_without_active_history():
+    params = _tiny_params()
+    positions = _tiny_positions()
+    state = wssr.WSSRCoreState(
+        sr_o=jnp.array(
+            [
+                [1.0, -2.0, 3.0, -4.0, 5.0],
+                [0.5, 1.5, -0.5, 2.5, -1.0],
+                [-1.0, 0.25, 0.75, -0.75, 1.25],
+            ]
+        ),
+        ek=jnp.zeros((5,)),
+        sr_rank0=jnp.array(0),
+        sr_rank=jnp.array(3),
+    )
+
+    assert positions.shape[0] > jax.flatten_util.ravel_pytree(params)[0].shape[0]
+    _assert_augmented_matrix_free_products_match_explicit(
+        _log_psi_apply, params, positions, state, eta=0.99
+    )
+
+
+def test_augmented_matrix_free_products_match_explicit_with_active_history():
+    params = {
+        "w": jnp.array([[0.2, -0.1, 0.3], [0.7, -0.4, 0.5]]),
+        "b": jnp.array([0.1, -0.2]),
+        "scale": jnp.array(0.4),
+    }
+    positions = jnp.array(
+        [
+            [0.5, -1.0, 0.25],
+            [1.5, 0.2, -0.75],
+            [-0.25, 0.4, 1.0],
+        ]
+    )
+    state = wssr.WSSRCoreState(
+        sr_o=jnp.array(
+            [
+                [0.5, -1.0, 10.0, 20.0, -30.0],
+                [1.5, 0.25, -10.0, 40.0, 50.0],
+                [-0.5, 0.75, 60.0, -70.0, 80.0],
+                [0.2, -0.4, -90.0, 100.0, 110.0],
+                [1.2, 0.8, 120.0, 130.0, -140.0],
+                [-1.1, 0.3, 150.0, -160.0, 170.0],
+                [0.9, -0.7, -180.0, 190.0, 200.0],
+                [0.4, 1.4, 210.0, -220.0, 230.0],
+                [-0.8, 0.6, -240.0, 250.0, -260.0],
+            ]
+        ),
+        ek=jnp.zeros((5,)),
+        sr_rank0=jnp.array(2),
+        sr_rank=jnp.array(4),
+    )
+
+    def log_psi_apply(params, position):
+        hidden = jnp.tanh(params["w"] @ position + params["b"])
+        return jnp.sum(hidden) + params["scale"] * jnp.prod(position)
+
+    assert state.sr_o.shape[1] > int(state.sr_rank0)
+    assert jax.flatten_util.ravel_pytree(params)[0].shape[0] > positions.shape[0]
+    _assert_augmented_matrix_free_products_match_explicit(
+        log_psi_apply, params, positions, state, eta=0.99
+    )
+
+
 def test_center_and_scale_energy_residuals_uses_julia_convention():
     local_energies = jnp.array([1.0, 3.0, -2.0, 6.0])
     energy = jnp.mean(local_energies)

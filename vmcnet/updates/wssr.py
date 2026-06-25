@@ -174,6 +174,64 @@ def score_rmatvec_current(
     return centered_jvp_values / jnp.sqrt(positions.shape[0])
 
 
+def wssr_augmented_matvec(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    aug_vector: Array,
+) -> Array:
+    """Compute ``O_aug @ aug_vector`` without materializing current scores.
+
+    The augmented matrix matches :func:`augment_wssr_system`. History columns
+    remain explicit through ``state.sr_o``; the current score block is applied
+    through :func:`score_matvec_current`.
+    """
+    history_width = state.sr_o.shape[1]
+    v_hist = aug_vector[:history_width]
+    v_cur = aug_vector[history_width:]
+
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(v_hist.dtype)
+    has_history = state.sr_rank0 > 0
+    sqrt_eta = jnp.sqrt(eta)
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        v_cur.dtype
+    )
+
+    history_term = sqrt_eta * (state.sr_o @ (history_mask * v_hist))
+    current_term = current_scale * score_matvec_current(
+        log_psi_apply, params, positions, v_cur
+    )
+    return history_term + current_term
+
+
+def wssr_augmented_rmatvec(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    param_vector: Array,
+) -> Array:
+    """Compute ``O_aug.T @ param_vector`` without materializing current scores."""
+    history_width = state.sr_o.shape[1]
+    history_mask = (jnp.arange(history_width) < state.sr_rank0).astype(
+        param_vector.dtype
+    )
+    has_history = state.sr_rank0 > 0
+    sqrt_eta = jnp.sqrt(eta)
+    current_scale = jnp.where(has_history, jnp.sqrt(1.0 - eta), 1.0).astype(
+        param_vector.dtype
+    )
+
+    history_term = sqrt_eta * history_mask * (state.sr_o.T @ param_vector)
+    current_term = current_scale * score_rmatvec_current(
+        log_psi_apply, params, positions, param_vector
+    )
+    return jnp.concatenate([history_term, current_term], axis=0)
+
+
 def center_and_scale_energy_residuals(local_energies: Array, energy: Array) -> Array:
     """Center local-energy residuals and apply Julia WSSR scaling."""
     residuals = local_energies - energy
