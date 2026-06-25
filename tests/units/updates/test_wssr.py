@@ -136,6 +136,17 @@ def test_default_config_contains_wssr_warm_svd_right():
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank == -1
 
 
+def test_default_config_contains_wssr_warm_svd_right_matfree():
+    config = default_config.get_default_config()
+
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.learning_rate == 5e-2
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank == 10
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max == 100
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_initial == 8
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_warm == 2
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank == -1
+
+
 def test_center_and_scale_score_matrix_uses_julia_convention():
     params = _tiny_params()
     positions = _tiny_positions()
@@ -2184,6 +2195,147 @@ def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_stat
     assert key.shape == (2,)
 
 
+def test_initialize_optimizer_dispatches_wssr_warm_svd_right_matfree_and_constructs_state():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right_matfree"
+    config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank = 2
+    config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max = 5
+    config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank = 3
+
+    update_param_fn, optimizer_state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(0),
+        apply_pmap=False,
+    )
+
+    assert callable(update_param_fn)
+    assert isinstance(optimizer_state, wssr.WSSROptimizerState)
+    assert isinstance(optimizer_state.core_state, wssr.WSSRWarmSVDCoreState)
+    assert optimizer_state.core_state.u.shape == (
+        3,
+        config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max,
+    )
+    assert optimizer_state.core_state.sr_o.shape == (
+        3,
+        config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max,
+    )
+    assert not hasattr(optimizer_state.core_state, "v")
+    assert optimizer_state.core_state.has_u == jnp.array(False)
+    assert key.shape == (2,)
+
+
+def test_wssr_warm_svd_right_matfree_one_update_matches_explicit_right_path():
+    params = _tiny_params()
+    data = _tiny_positions()
+    explicit_config = default_config.get_default_config()
+    explicit_config.vmc.nchains = data.shape[0]
+    explicit_config.vmc.optimizer_type = "wssr_warm_svd_right"
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.schedule_type = "constant"
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.learning_rate = 0.125
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.constrain_norm = False
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 2
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 5
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 3
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial = 2
+    explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm = 1
+
+    matfree_config = default_config.get_default_config()
+    matfree_config.vmc.nchains = data.shape[0]
+    matfree_config.vmc.optimizer_type = "wssr_warm_svd_right_matfree"
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.schedule_type = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.schedule_type
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.learning_rate = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.learning_rate
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.constrain_norm = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.constrain_norm
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.sr_rank
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_initial = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial
+    )
+    matfree_config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_warm = (
+        explicit_config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm
+    )
+
+    key = jax.random.PRNGKey(8)
+    explicit_update_fn, explicit_state, explicit_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        explicit_config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        key,
+        apply_pmap=False,
+    )
+    matfree_update_fn, matfree_state, matfree_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        matfree_config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        key,
+        apply_pmap=False,
+    )
+
+    explicit_params, _, explicit_state_1, explicit_metrics, explicit_key_1 = (
+        explicit_update_fn(params, data, explicit_state, explicit_key)
+    )
+    matfree_params, _, matfree_state_1, matfree_metrics, matfree_key_1 = (
+        matfree_update_fn(params, data, matfree_state, matfree_key)
+    )
+
+    assert_pytree_allclose(matfree_params, explicit_params, rtol=1e-4, atol=1e-4)
+    assert set(matfree_metrics).issuperset({"energy", "variance", "energy_noclip"})
+    assert set(explicit_metrics).issuperset({"energy", "variance", "energy_noclip"})
+    chex.assert_trees_all_close(
+        matfree_state_1.core_state.sr_o,
+        explicit_state_1.core_state.sr_o,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    chex.assert_trees_all_close(
+        matfree_state_1.core_state.ek,
+        explicit_state_1.core_state.ek,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    chex.assert_trees_all_close(
+        matfree_state_1.core_state.sr_rank0, explicit_state_1.core_state.sr_rank0
+    )
+    chex.assert_trees_all_close(
+        matfree_state_1.core_state.sr_rank, explicit_state_1.core_state.sr_rank
+    )
+    assert matfree_state_1.core_state.u.shape == explicit_state_1.core_state.u.shape
+    assert not hasattr(matfree_state_1.core_state, "v")
+    chex.assert_trees_all_close(matfree_key_1, explicit_key_1)
+
+
 def test_wssr_warm_svd_right_integrated_two_updates_have_no_nans():
     params = _tiny_params()
     data = _tiny_positions()
@@ -2267,3 +2419,31 @@ def test_initialize_wssr_warm_svd_right_rejects_pmap_until_jit_safe_core_exists(
         assert "apply_pmap=False" in str(err)
     else:
         raise AssertionError("Expected wssr_warm_svd_right to reject apply_pmap=True")
+
+
+def test_initialize_wssr_warm_svd_right_matfree_rejects_pmap_until_supported():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right_matfree"
+
+    try:
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=True,
+        )
+    except NotImplementedError as err:
+        assert "apply_pmap=False" in str(err)
+    else:
+        raise AssertionError(
+            "Expected wssr_warm_svd_right_matfree to reject apply_pmap=True"
+        )

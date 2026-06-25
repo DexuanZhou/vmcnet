@@ -1686,6 +1686,73 @@ def construct_wssr_warm_svd_right_update_param_fn(
     return jax.jit(update_param_fn)
 
 
+def construct_wssr_warm_svd_right_matfree_update_param_fn(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    optimizer: optax.GradientTransformation,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+) -> UpdateParamFn[P, D, WSSROptimizerState]:
+    """Create the experimental matrix-free right warm-SVD WSSR update function."""
+
+    def update_param_fn(params, data, optimizer_state, key):
+        position = get_position_fn(data)
+        energy, local_energies, stats = energy_and_statistics_fn(params, position)
+        key, svd_key = jax.random.split(key)
+
+        grad_like_update, core_state, _ = (
+            compute_wssr_warm_svd_right_core_update_matfree(
+                log_psi_apply,
+                params,
+                position,
+                local_energies,
+                energy,
+                optimizer_state.core_state,
+                svd_key,
+                optimizer_config.eta,
+                optimizer_config.damping,
+                optimizer_config.norm_constraint,
+                optimizer_config.sr_rank_max,
+                sr_scale=optimizer_config.sr_scale,
+                svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
+                svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
+                svd_working_rank=optimizer_config.get("svd_working_rank", None),
+                constrain_update_norm=False,
+            )
+        )
+
+        updates, optax_state = optimizer.update(
+            grad_like_update, optimizer_state.optax_state, params
+        )
+        if optimizer_config.constrain_norm:
+            updates = constrain_update_tree_norm(
+                updates, optimizer_config.norm_constraint
+            )
+        params = optax.apply_updates(params, updates)
+        data = update_data_fn(data, params)
+
+        metrics = {"energy": energy, "variance": stats["variance"]}
+        metrics = update_metrics_with_noclip(
+            stats["energy_noclip"],
+            stats["variance_noclip"],
+            metrics,
+        )
+        if record_param_l1_norm:
+            metrics.update({"param_l1_norm": tree_reduce_l1(params)})
+
+        return (
+            params,
+            data,
+            WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+            metrics,
+            key,
+        )
+
+    return update_param_fn
+
+
 def initialize_wssr_svd(
     log_psi_apply: ModelApply[P],
     energy_and_statistics_fn,
@@ -1713,6 +1780,49 @@ def initialize_wssr_svd(
     )
     optax_state = optimizer.init(params)
     update_param_fn = construct_wssr_svd_update_param_fn(
+        log_psi_apply,
+        energy_and_statistics_fn,
+        optimizer,
+        get_position_fn,
+        update_data_fn,
+        optimizer_config,
+        record_param_l1_norm=record_param_l1_norm,
+    )
+    return (
+        update_param_fn,
+        WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+    )
+
+
+def initialize_wssr_warm_svd_right_matfree(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    params: P,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    learning_rate_schedule: LearningRateSchedule,
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+    apply_pmap: bool = True,
+) -> Tuple[UpdateParamFn[P, D, WSSROptimizerState], WSSROptimizerState]:
+    """Get an experimental matrix-free right warm-start SVD WSSR updater."""
+    if apply_pmap:
+        raise NotImplementedError(
+            "wssr_warm_svd_right_matfree currently supports apply_pmap=False only"
+        )
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    core_state = initialize_wssr_warm_svd_core_state(
+        flat_params.shape[0],
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        dtype=flat_params.dtype,
+    )
+    optimizer = optax.sgd(
+        learning_rate=learning_rate_schedule, momentum=0, nesterov=False
+    )
+    optax_state = optimizer.init(params)
+    update_param_fn = construct_wssr_warm_svd_right_matfree_update_param_fn(
         log_psi_apply,
         energy_and_statistics_fn,
         optimizer,

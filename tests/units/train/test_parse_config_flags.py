@@ -113,6 +113,49 @@ def test_parse_config_accepts_wssr_warm_svd_right_optimizer_type(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_accepts_wssr_warm_svd_right_matfree_optimizer_type(mocker):
+    """Test that the matrix-free right WSSR optimizer is a visible option."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        ["vmcnet", "--config.vmc.optimizer_type=wssr_warm_svd_right_matfree"],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_warm_svd_right_matfree"
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
+def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
+    """Test command-line overrides for key matrix-free right WSSR fields."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        [
+            "vmcnet",
+            "--config.vmc.optimizer_type=wssr_warm_svd_right_matfree",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.learning_rate=0.02",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.damping=0.005",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank=12",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max=80",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank=24",
+        ],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_warm_svd_right_matfree"
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.learning_rate = 0.02
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.damping = 0.005
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank = 12
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.sr_rank_max = 80
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank = 24
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_setting_duplicated_config_flag_sets_only_desired_flag(mocker):
     """Test changing normal_init.type only affects the desired instance of the flag.
 
