@@ -184,6 +184,62 @@ def test_center_and_scale_score_matrix_matches_per_sample_ravel_construction():
     np.testing.assert_allclose(o_cur, expected, rtol=1e-6, atol=1e-6)
 
 
+def _assert_matrix_free_score_products_match_explicit(
+    log_psi_apply, params, positions, sample_weights
+):
+    o_cur, _ = wssr.center_and_scale_score_matrix(log_psi_apply, params, positions)
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    param_vector = jnp.linspace(-0.7, 0.9, flat_params.shape[0])
+
+    matvec = wssr.score_matvec_current(
+        log_psi_apply, params, positions, sample_weights
+    )
+    rmatvec = wssr.score_rmatvec_current(
+        log_psi_apply, params, positions, param_vector
+    )
+
+    np.testing.assert_allclose(matvec, o_cur @ sample_weights, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(rmatvec, o_cur.T @ param_vector, rtol=1e-5, atol=1e-5)
+
+
+def test_matrix_free_score_products_match_explicit_when_samples_exceed_params():
+    params = _tiny_params()
+    positions = _tiny_positions()
+    sample_weights = jnp.array([1.5, -0.25, 2.0, 0.75])
+
+    assert positions.shape[0] > jax.flatten_util.ravel_pytree(params)[0].shape[0]
+    assert not np.allclose(jnp.mean(sample_weights), 0.0)
+    _assert_matrix_free_score_products_match_explicit(
+        _log_psi_apply, params, positions, sample_weights
+    )
+
+
+def test_matrix_free_score_products_match_explicit_when_params_exceed_samples():
+    params = {
+        "w": jnp.array([[0.2, -0.1, 0.3], [0.7, -0.4, 0.5]]),
+        "b": jnp.array([0.1, -0.2]),
+        "scale": jnp.array(0.4),
+    }
+    positions = jnp.array(
+        [
+            [0.5, -1.0, 0.25],
+            [1.5, 0.2, -0.75],
+            [-0.25, 0.4, 1.0],
+        ]
+    )
+    sample_weights = jnp.array([2.0, -1.0, 0.5])
+
+    def log_psi_apply(params, position):
+        hidden = jnp.tanh(params["w"] @ position + params["b"])
+        return jnp.sum(hidden) + params["scale"] * jnp.prod(position)
+
+    assert jax.flatten_util.ravel_pytree(params)[0].shape[0] > positions.shape[0]
+    assert not np.allclose(jnp.mean(sample_weights), 0.0)
+    _assert_matrix_free_score_products_match_explicit(
+        log_psi_apply, params, positions, sample_weights
+    )
+
+
 def test_center_and_scale_energy_residuals_uses_julia_convention():
     local_energies = jnp.array([1.0, 3.0, -2.0, 6.0])
     energy = jnp.mean(local_energies)

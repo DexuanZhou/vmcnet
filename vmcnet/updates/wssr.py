@@ -128,6 +128,52 @@ def center_and_scale_score_matrix(
     return score_samples.T / scale, unravel_fn
 
 
+def score_matvec_current(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    sample_weights: Array,
+) -> Array:
+    """Compute ``O_cur @ sample_weights`` without materializing ``O_cur``.
+
+    ``O_cur`` is the centered and ``1 / sqrt(num_samples)``-scaled score
+    matrix returned by :func:`center_and_scale_score_matrix`.
+    """
+
+    def log_psi_samples(params):
+        return jax.vmap(log_psi_apply, in_axes=(None, 0))(params, positions)
+
+    centered_weights = sample_weights - jnp.mean(sample_weights)
+    scaled_weights = centered_weights / jnp.sqrt(positions.shape[0])
+    _, pullback = jax.vjp(log_psi_samples, params)
+    grad_tree = pullback(scaled_weights)[0]
+    flat_grad, _ = jax.flatten_util.ravel_pytree(grad_tree)
+    return flat_grad
+
+
+def score_rmatvec_current(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    param_vector: Array,
+) -> Array:
+    """Compute ``O_cur.T @ param_vector`` without materializing ``O_cur``.
+
+    ``O_cur`` is the centered and ``1 / sqrt(num_samples)``-scaled score
+    matrix returned by :func:`center_and_scale_score_matrix`.
+    """
+
+    _, unravel_fn = jax.flatten_util.ravel_pytree(params)
+    param_tangent = unravel_fn(param_vector)
+
+    def log_psi_samples(params):
+        return jax.vmap(log_psi_apply, in_axes=(None, 0))(params, positions)
+
+    _, jvp_values = jax.jvp(log_psi_samples, (params,), (param_tangent,))
+    centered_jvp_values = jvp_values - jnp.mean(jvp_values)
+    return centered_jvp_values / jnp.sqrt(positions.shape[0])
+
+
 def center_and_scale_energy_residuals(local_energies: Array, energy: Array) -> Array:
     """Center local-energy residuals and apply Julia WSSR scaling."""
     residuals = local_energies - energy
