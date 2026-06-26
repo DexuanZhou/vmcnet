@@ -83,6 +83,59 @@ def _assert_wssr_rank_metrics(
     assert 0 <= metrics["wssr_sr_rank0"] <= metrics["wssr_sr_rank"]
 
 
+def _spectral_regularization_fixture():
+    state = wssr.initialize_wssr_core_state(
+        num_params=3, sr_rank=3, sr_rank_max=3, dtype=jnp.float32
+    )
+    o_aug = jnp.array(
+        [
+            [1.0, -0.5, 0.25, 1.25],
+            [0.25, 1.5, -1.0, -0.75],
+            [1.5, 0.75, 0.5, -0.25],
+        ],
+        dtype=jnp.float32,
+    )
+    e_aug = jnp.array([0.5, -0.25, 0.75, -0.125], dtype=jnp.float32)
+    u = jnp.eye(3, dtype=jnp.float32)
+    singular_values = jnp.array([4.0, 2.0, 0.75], dtype=jnp.float32)
+    vh = jnp.array(
+        [
+            [0.5, -0.5, 0.25, 0.25],
+            [0.25, 0.75, -0.5, 0.125],
+            [-0.5, 0.25, 0.5, -0.25],
+        ],
+        dtype=jnp.float32,
+    )
+    return state, o_aug, e_aug, u, singular_values, vh
+
+
+def _expected_wssr_spectral_update(
+    o_aug,
+    e_aug,
+    u,
+    singular_values,
+    damping,
+    spectral_regularization,
+    complement_weight,
+):
+    force = o_aug @ e_aug
+    leading_sv = singular_values[0]
+    retained = singular_values / leading_sv > damping
+    retained_float = retained.astype(o_aug.dtype)
+    sigma_floor = jnp.square(damping * jnp.abs(leading_sv))
+    inv_floor = 1.0 / sigma_floor
+    if spectral_regularization == "hard_floor":
+        inv_cap = jnp.square(1.0 / singular_values)
+    elif spectral_regularization == "tikhonov":
+        inv_cap = 1.0 / (jnp.square(singular_values) + sigma_floor)
+    else:
+        raise ValueError("bad test spectral_regularization")
+    inv_perp = complement_weight * inv_floor
+    projected_force = u.T @ force
+    projected_force = projected_force * (inv_cap - inv_perp) * retained_float
+    return u @ projected_force + inv_perp * force
+
+
 def _legacy_dynamic_augment_wssr_system(o_cur, e_cur, state, eta):
     active_rank = int(state.sr_rank0)
     if active_rank == 0:
@@ -169,6 +222,10 @@ def test_default_config_contains_wssr_warm_svd_right():
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm == 2
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right.spectral_regularization == (
+        "hard_floor"
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.complement_weight == 1.0
 
 
 def test_default_config_contains_wssr_warm_svd_right_matfree():
@@ -181,6 +238,10 @@ def test_default_config_contains_wssr_warm_svd_right_matfree():
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_maxiter_warm == 2
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.spectral_regularization == (
+        "hard_floor"
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.complement_weight == 1.0
 
 
 def test_center_and_scale_score_matrix_uses_julia_convention():
@@ -612,6 +673,150 @@ def test_wssr_svd_core_matches_spec_formula_without_lr_or_minus_sign():
         result.grad_like_update, expected, rtol=1e-5, atol=1e-5
     )
     assert not np.allclose(result.grad_like_update, -expected, rtol=1e-5, atol=1e-5)
+
+
+def test_wssr_update_hard_floor_default_matches_previous_formula():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    damping = 0.1
+
+    result = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping=damping,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="hard_floor",
+        complement_weight=1.0,
+    )
+
+    inv_floor = 1.0 / jnp.square(damping * jnp.abs(singular_values[0]))
+    force = o_aug @ e_aug
+    projected_force = u.T @ force
+    projected_force = projected_force * (jnp.square(1.0 / singular_values) - inv_floor)
+    expected = u @ projected_force + inv_floor * force
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("complement_weight", [0.0, 0.3])
+def test_wssr_update_hard_floor_complement_weight_matches_formula(
+    complement_weight,
+):
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    damping = 0.1
+
+    result = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping=damping,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="hard_floor",
+        complement_weight=complement_weight,
+    )
+
+    expected = _expected_wssr_spectral_update(
+        o_aug,
+        e_aug,
+        u,
+        singular_values,
+        damping,
+        spectral_regularization="hard_floor",
+        complement_weight=complement_weight,
+    )
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("complement_weight", [1.0, 0.0])
+def test_wssr_update_tikhonov_complement_weight_matches_formula(
+    complement_weight,
+):
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    damping = 0.1
+
+    result = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping=damping,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=complement_weight,
+    )
+
+    expected = _expected_wssr_spectral_update(
+        o_aug,
+        e_aug,
+        u,
+        singular_values,
+        damping,
+        spectral_regularization="tikhonov",
+        complement_weight=complement_weight,
+    )
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=1e-5, atol=1e-5
+    )
+
+
+def test_wssr_update_rejects_invalid_spectral_regularization():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+
+    with pytest.raises(ValueError, match="spectral_regularization"):
+        wssr._wssr_update_from_svd(
+            o_aug,
+            e_aug,
+            state,
+            u,
+            singular_values,
+            vh,
+            damping=0.1,
+            norm_constraint=10.0,
+            sr_rank_max=state.sr_o.shape[1],
+            sr_scale=1.1,
+            constrain_update_norm=False,
+            spectral_regularization="bad_mode",
+        )
+
+
+def test_wssr_update_rejects_negative_complement_weight():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+
+    with pytest.raises(ValueError, match="complement_weight"):
+        wssr._wssr_update_from_svd(
+            o_aug,
+            e_aug,
+            state,
+            u,
+            singular_values,
+            vh,
+            damping=0.1,
+            norm_constraint=10.0,
+            sr_rank_max=state.sr_o.shape[1],
+            sr_scale=1.1,
+            constrain_update_norm=False,
+            complement_weight=-0.1,
+        )
 
 
 def test_wssr_svd_core_applies_safe_norm_constraint():
@@ -1306,6 +1511,8 @@ def test_wssr_warm_svd_working_rank_keeps_fixed_state_shape_and_masks_tail():
         svd_maxiter_warm=1,
         svd_working_rank=3,
         constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.3,
     )
 
     assert result.state.sr_o.shape == (5, 6)
@@ -1421,6 +1628,8 @@ def test_wssr_warm_svd_core_jits_and_preserves_rank_growth_history():
             "svd_maxiter_warm",
             "svd_working_rank",
             "constrain_update_norm",
+            "spectral_regularization",
+            "complement_weight",
         ),
     )
 
@@ -2429,6 +2638,38 @@ def test_initialize_wssr_warm_svd_right_rejects_storage_rank_below_initial_rank(
     config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank = 5
 
     with pytest.raises(ValueError, match="sr_storage_rank"):
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("spectral_regularization", "bad_mode", "spectral_regularization"),
+        ("complement_weight", -0.1, "complement_weight"),
+    ],
+)
+def test_initialize_wssr_warm_svd_right_rejects_invalid_regularization_config(
+    field, value, match
+):
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    setattr(config.vmc.optimizer.wssr_warm_svd_right, field, value)
+
+    with pytest.raises(ValueError, match=match):
         initialize_optimizer(
             _log_psi_apply,
             _local_energy_fn,

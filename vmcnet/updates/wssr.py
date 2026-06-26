@@ -474,6 +474,44 @@ def resolve_wssr_storage_rank(
     return storage_rank
 
 
+_WSSR_SPECTRAL_REGULARIZATIONS = ("hard_floor", "tikhonov")
+
+
+def _validate_wssr_spectral_regularization(
+    spectral_regularization: str,
+    complement_weight: chex.Numeric,
+) -> None:
+    if spectral_regularization not in _WSSR_SPECTRAL_REGULARIZATIONS:
+        raise ValueError(
+            "spectral_regularization must be one of "
+            f"{_WSSR_SPECTRAL_REGULARIZATIONS}"
+        )
+    if complement_weight < 0:
+        raise ValueError("complement_weight must be nonnegative")
+
+
+def _wssr_inverse_spectral_coefficients(
+    safe_singular_values: Array,
+    safe_leading_sv: Array,
+    safe_damping: Array,
+    spectral_regularization: str,
+    complement_weight: chex.Numeric,
+) -> Tuple[Array, Array]:
+    """Return range and complement inverse coefficients for the WSSR update."""
+    _validate_wssr_spectral_regularization(
+        spectral_regularization, complement_weight
+    )
+    sigma_floor = jnp.square(safe_damping * jnp.abs(safe_leading_sv))
+    inv_floor = 1.0 / sigma_floor
+    if spectral_regularization == "hard_floor":
+        inv_cap = jnp.square(1.0 / safe_singular_values)
+    else:
+        inv_cap = 1.0 / (jnp.square(safe_singular_values) + sigma_floor)
+    inv_perp = jnp.asarray(complement_weight, dtype=safe_singular_values.dtype)
+    inv_perp = inv_perp * inv_floor
+    return inv_cap, inv_perp
+
+
 def _update_metrics_with_wssr_rank_diagnostics(
     metrics,
     active_rank: Array,
@@ -552,6 +590,8 @@ def _wssr_update_from_svd(
     sr_scale: chex.Numeric,
     constrain_update_norm: bool,
     rank_update_max: Optional[int] = None,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Apply the shared post-SVD WSSR update formula."""
@@ -578,14 +618,18 @@ def _wssr_update_from_svd(
 
     safe_singular_values = jnp.where(retained, singular_values, 1.0)
     safe_damping = jnp.maximum(jnp.abs(damping), eps)
-    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(safe_leading_sv))
+    inv_cap, inv_perp = _wssr_inverse_spectral_coefficients(
+        safe_singular_values,
+        safe_leading_sv,
+        safe_damping,
+        spectral_regularization,
+        complement_weight,
+    )
     force = o_aug @ e_aug
     projected_force = u.T @ force
-    projected_force = projected_force * (
-        jnp.square(1.0 / safe_singular_values) - sigma0
-    )
+    projected_force = projected_force * (inv_cap - inv_perp)
     projected_force = projected_force * retained_float
-    grad_like_update = u @ projected_force + sigma0 * force
+    grad_like_update = u @ projected_force + inv_perp * force
     grad_like_update = jnp.where(valid_update, grad_like_update, 0.0)
 
     if constrain_update_norm:
@@ -638,6 +682,8 @@ def _wssr_update_from_svd_matfree(
     sr_scale: chex.Numeric,
     constrain_update_norm: bool,
     rank_update_max: Optional[int] = None,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Matrix-free analogue of :func:`_wssr_update_from_svd`."""
@@ -665,7 +711,13 @@ def _wssr_update_from_svd_matfree(
 
     safe_singular_values = jnp.where(retained, singular_values, 1.0)
     safe_damping = jnp.maximum(jnp.abs(damping), eps)
-    sigma0 = 1.0 / jnp.square(safe_damping * jnp.abs(safe_leading_sv))
+    inv_cap, inv_perp = _wssr_inverse_spectral_coefficients(
+        safe_singular_values,
+        safe_leading_sv,
+        safe_damping,
+        spectral_regularization,
+        complement_weight,
+    )
     force = wssr_augmented_matvec(
         log_psi_apply,
         params,
@@ -675,11 +727,9 @@ def _wssr_update_from_svd_matfree(
         e_aug,
     )
     projected_force = u.T @ force
-    projected_force = projected_force * (
-        jnp.square(1.0 / safe_singular_values) - sigma0
-    )
+    projected_force = projected_force * (inv_cap - inv_perp)
     projected_force = projected_force * retained_float
-    grad_like_update = u @ projected_force + sigma0 * force
+    grad_like_update = u @ projected_force + inv_perp * force
     grad_like_update = jnp.where(valid_update, grad_like_update, 0.0)
 
     if constrain_update_norm:
@@ -1192,6 +1242,8 @@ def wssr_warm_svd_core_update(
     svd_maxiter_warm: int = 2,
     svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Compute one warm-start subspace-iteration WSSR core update."""
@@ -1225,6 +1277,8 @@ def wssr_warm_svd_core_update(
         sr_scale,
         constrain_update_norm,
         rank_update_max=working_rank_max,
+        spectral_regularization=spectral_regularization,
+        complement_weight=complement_weight,
         eps=eps,
     )
     u_state = jnp.zeros_like(state.u)
@@ -1250,6 +1304,8 @@ _jitted_wssr_warm_svd_core_update = jax.jit(
         "svd_maxiter_warm",
         "svd_working_rank",
         "constrain_update_norm",
+        "spectral_regularization",
+        "complement_weight",
     ),
 )
 
@@ -1267,6 +1323,8 @@ def wssr_warm_svd_right_core_update(
     svd_maxiter_warm: int = 2,
     svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
     eps: chex.Numeric = 1e-12,
 ) -> WSSRSVDResult:
     """Compute one right-subspace warm-start SVD WSSR core update."""
@@ -1303,6 +1361,8 @@ def wssr_warm_svd_right_core_update(
         sr_scale,
         constrain_update_norm,
         rank_update_max=working_rank_max,
+        spectral_regularization=spectral_regularization,
+        complement_weight=complement_weight,
         eps=eps,
     )
     u_state = jnp.zeros_like(state.u)
@@ -1328,6 +1388,8 @@ _jitted_wssr_warm_svd_right_core_update = jax.jit(
         "svd_maxiter_warm",
         "svd_working_rank",
         "constrain_update_norm",
+        "spectral_regularization",
+        "complement_weight",
     ),
 )
 
@@ -1421,6 +1483,8 @@ def compute_wssr_warm_svd_core_update(
     svd_maxiter_warm: int = 2,
     svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
 ) -> Tuple[P, WSSRWarmSVDCoreState, int]:
     """Compute a warm-start SVD WSSR core update and unflatten it."""
     o_cur, unravel_fn = center_and_scale_score_matrix(
@@ -1441,6 +1505,8 @@ def compute_wssr_warm_svd_core_update(
         svd_maxiter_warm=svd_maxiter_warm,
         svd_working_rank=svd_working_rank,
         constrain_update_norm=constrain_update_norm,
+        spectral_regularization=spectral_regularization,
+        complement_weight=complement_weight,
     )
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
 
@@ -1462,6 +1528,8 @@ def compute_wssr_warm_svd_right_core_update(
     svd_maxiter_warm: int = 2,
     svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
 ) -> Tuple[P, WSSRWarmSVDCoreState, int]:
     """Compute a right-subspace warm-start SVD WSSR update and unflatten it."""
     o_cur, unravel_fn = center_and_scale_score_matrix(
@@ -1482,6 +1550,8 @@ def compute_wssr_warm_svd_right_core_update(
         svd_maxiter_warm=svd_maxiter_warm,
         svd_working_rank=svd_working_rank,
         constrain_update_norm=constrain_update_norm,
+        spectral_regularization=spectral_regularization,
+        complement_weight=complement_weight,
     )
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
 
@@ -1503,6 +1573,8 @@ def compute_wssr_warm_svd_right_core_update_matfree(
     svd_maxiter_warm: int = 2,
     svd_working_rank: Optional[int] = None,
     constrain_update_norm: bool = True,
+    spectral_regularization: str = "hard_floor",
+    complement_weight: chex.Numeric = 1.0,
 ) -> Tuple[P, WSSRWarmSVDCoreState, int]:
     """Matrix-free right-subspace warm-start SVD WSSR core update."""
     _, unravel_fn = jax.flatten_util.ravel_pytree(params)
@@ -1538,6 +1610,8 @@ def compute_wssr_warm_svd_right_core_update_matfree(
         sr_scale,
         constrain_update_norm,
         rank_update_max=working_rank_max,
+        spectral_regularization=spectral_regularization,
+        complement_weight=complement_weight,
     )
     u_state = jnp.zeros_like(state.u)
     warm_width = min(u.shape[1], state.u.shape[1])
@@ -1776,6 +1850,10 @@ def construct_wssr_warm_svd_right_update_param_fn(
     record_param_l1_norm: bool = False,
 ) -> UpdateParamFn[P, D, WSSROptimizerState]:
     """Create the integrated right-subspace warm-start SVD WSSR update function."""
+    _validate_wssr_spectral_regularization(
+        optimizer_config.get("spectral_regularization", "hard_floor"),
+        optimizer_config.get("complement_weight", 1.0),
+    )
 
     def update_param_fn(params, data, optimizer_state, key):
         position = get_position_fn(data)
@@ -1800,6 +1878,10 @@ def construct_wssr_warm_svd_right_update_param_fn(
                 svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
                 svd_working_rank=optimizer_config.get("svd_working_rank", None),
                 constrain_update_norm=False,
+                spectral_regularization=optimizer_config.get(
+                    "spectral_regularization", "hard_floor"
+                ),
+                complement_weight=optimizer_config.get("complement_weight", 1.0),
             )
         )
 
@@ -1850,6 +1932,10 @@ def construct_wssr_warm_svd_right_matfree_update_param_fn(
     record_param_l1_norm: bool = False,
 ) -> UpdateParamFn[P, D, WSSROptimizerState]:
     """Create the experimental matrix-free right warm-SVD WSSR update function."""
+    _validate_wssr_spectral_regularization(
+        optimizer_config.get("spectral_regularization", "hard_floor"),
+        optimizer_config.get("complement_weight", 1.0),
+    )
 
     def update_param_fn(params, data, optimizer_state, key):
         position = get_position_fn(data)
@@ -1874,6 +1960,10 @@ def construct_wssr_warm_svd_right_matfree_update_param_fn(
                 svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
                 svd_working_rank=optimizer_config.get("svd_working_rank", None),
                 constrain_update_norm=False,
+                spectral_regularization=optimizer_config.get(
+                    "spectral_regularization", "hard_floor"
+                ),
+                complement_weight=optimizer_config.get("complement_weight", 1.0),
             )
         )
 
