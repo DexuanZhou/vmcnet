@@ -633,6 +633,7 @@ def log_vmc_loop_state(epoch: int, metrics: Dict, checkpoint_str: str) -> None:
     energy_str = "Energy: %(energy).5e"
     variance_str = "Variance: %(variance).5e"
     accept_ratio_str = "Accept ratio: %(accept_ratio).5f"
+    smooth20_str = ""
     amplitude_str = ""
 
     if "energy_noclip" in metrics:
@@ -644,9 +645,20 @@ def log_vmc_loop_state(epoch: int, metrics: Dict, checkpoint_str: str) -> None:
     if "amplitude_min" in metrics:
         amplitude_str = "Min/max amplitude: %(amplitude_min).2f/%(amplitude_max).2f"
 
-    info_out = ", ".join(
-        [epoch_str, energy_str, variance_str, accept_ratio_str, amplitude_str]
-    )
+    if "energy_smooth20" in metrics:
+        smooth20_str = (
+            "Energy smooth20: %(energy_smooth20).5e, "
+            "Variance smooth20: %(variance_smooth20).5e, "
+            "Accept smooth20: %(accept_smooth20).5f, "
+            "Smooth20 window: %(smooth20_window)d"
+        )
+
+    info_parts = [epoch_str, energy_str, variance_str, accept_ratio_str]
+    if smooth20_str:
+        info_parts.append(smooth20_str)
+    if amplitude_str:
+        info_parts.append(amplitude_str)
+    info_out = ", ".join(info_parts)
     info_out = info_out + checkpoint_str
 
     logged_metrics = {"epoch": epoch + 1}

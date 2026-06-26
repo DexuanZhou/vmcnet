@@ -1,8 +1,12 @@
 """Main VMC loop."""
 
-from typing import Tuple, Optional
+import csv
+import math
+import os
+from typing import Optional, Sequence, Tuple
 
 import jax
+import jax.numpy as jnp
 import wandb
 
 from vmcnet.mcmc.metropolis import WalkerFn
@@ -10,6 +14,76 @@ from vmcnet.updates.update_param_fns import UpdateParamFn
 from vmcnet.utils.checkpoint import CheckpointWriter, MetricsWriter
 import vmcnet.utils as utils
 from vmcnet.utils.typing import D, GetAmplitudeFromData, P, PRNGKey, S
+
+
+_TRAINING_METRICS_CSV = "training_metrics.csv"
+_TRAINING_METRICS_CSV_FIELDS = (
+    "epoch",
+    "energy",
+    "energy_noclip",
+    "variance",
+    "variance_noclip",
+    "accept_ratio",
+    "energy_smooth20",
+    "variance_smooth20",
+    "accept_smooth20",
+    "smooth20_window",
+)
+
+
+def compute_rolling_smooth_metrics(
+    history: Sequence[float],
+    fraction: float = 0.2,
+    total_count: Optional[int] = None,
+) -> Tuple[Optional[float], int]:
+    """Compute a tail rolling average and its configured window size."""
+    if fraction <= 0.0:
+        raise ValueError("fraction must be positive")
+
+    if total_count is None:
+        total_count = len(history)
+    smooth_window = max(1, int(math.ceil(fraction * max(total_count, 1))))
+    if not history:
+        return None, smooth_window
+
+    window_start = max(0, len(history) - smooth_window)
+    window_values = history[window_start:]
+    return sum(window_values) / len(window_values), smooth_window
+
+
+def _metric_to_float(metric_value) -> float:
+    metric_value = jax.device_get(metric_value)
+    try:
+        return float(metric_value)
+    except (TypeError, ValueError):
+        return float(jnp.ravel(jnp.asarray(metric_value))[0])
+
+
+def _append_training_metrics_csv_row(
+    logdir: Optional[str],
+    epoch: int,
+    metrics: dict,
+) -> None:
+    if logdir is None:
+        return
+
+    csv_path = os.path.join(logdir, _TRAINING_METRICS_CSV)
+    write_header = not os.path.exists(csv_path)
+    row = {field: "" for field in _TRAINING_METRICS_CSV_FIELDS}
+    row["epoch"] = epoch + 1
+    for field in _TRAINING_METRICS_CSV_FIELDS:
+        if field == "epoch" or field not in metrics:
+            continue
+        if field == "smooth20_window":
+            row[field] = int(_metric_to_float(metrics[field]))
+        else:
+            row[field] = _metric_to_float(metrics[field])
+
+    with open(csv_path, "a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=_TRAINING_METRICS_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def vmc_loop(
@@ -103,6 +177,10 @@ def vmc_loop(
 
     MAX_WANDB_LOGS = 10000
     wandb_freq = nepochs // min(max(nepochs, 1), MAX_WANDB_LOGS)
+    smooth_segment_nepochs = max(1, nepochs - start_epoch)
+    energy_history = []
+    variance_history = []
+    accept_ratio_history = []
 
     with CheckpointWriter(
         is_pmapped
@@ -130,6 +208,21 @@ def vmc_loop(
                 continue
 
             metrics["accept_ratio"] = accept_ratio
+            energy_history.append(_metric_to_float(metrics["energy"]))
+            variance_history.append(_metric_to_float(metrics["variance"]))
+            accept_ratio_history.append(_metric_to_float(accept_ratio))
+            metrics["energy_smooth20"], smooth20_window = (
+                compute_rolling_smooth_metrics(
+                    energy_history, total_count=smooth_segment_nepochs
+                )
+            )
+            metrics["variance_smooth20"], _ = compute_rolling_smooth_metrics(
+                variance_history, total_count=smooth_segment_nepochs
+            )
+            metrics["accept_smooth20"], _ = compute_rolling_smooth_metrics(
+                accept_ratio_history, total_count=smooth_segment_nepochs
+            )
+            metrics["smooth20_window"] = smooth20_window
 
             (
                 checkpoint_metric,
@@ -160,6 +253,7 @@ def vmc_loop(
                 record_amplitudes=record_amplitudes,
                 get_amplitude_fn=get_amplitude_fn,
             )
+            _append_training_metrics_csv_row(logdir, epoch, metrics)
             utils.checkpoint.log_vmc_loop_state(epoch, metrics, checkpoint_str)
 
             if epoch % wandb_freq == 0:
