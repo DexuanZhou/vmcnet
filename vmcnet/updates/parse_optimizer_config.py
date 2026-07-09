@@ -26,6 +26,7 @@ from .spring import initialize_spring
 from .kfac import initialize_kfac
 from .gauss_newton import initialize_gauss_newton
 from .wssr import (
+    initialize_avg_minsr_svd_history,
     initialize_wssr_sketch,
     initialize_wssr_svd,
     initialize_wssr_warm_svd,
@@ -272,6 +273,25 @@ def initialize_optimizer(
             update_data_fn,
             learning_rate_schedule,
             vmc_config.optimizer.wssr_warm_svd_right_matfree,
+            vmc_config.record_param_l1_norm,
+            apply_pmap=apply_pmap,
+        )
+        return update_param_fn, optimizer_state, key
+    elif vmc_config.optimizer_type == "avg_minsr_svd_history":
+        energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(
+            local_energy_fn, vmc_config.nchains, clipping_fn, vmc_config.nan_safe
+        )
+        (
+            update_param_fn,
+            optimizer_state,
+        ) = initialize_avg_minsr_svd_history(
+            log_psi_apply,
+            energy_and_statistics_fn,
+            params,
+            get_position_fn,
+            update_data_fn,
+            learning_rate_schedule,
+            vmc_config.optimizer.avg_minsr_svd_history,
             vmc_config.record_param_l1_norm,
             apply_pmap=apply_pmap,
         )

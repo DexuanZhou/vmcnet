@@ -368,6 +368,22 @@ def get_default_vmc_config() -> Dict:
                 "spectral_regularization": "hard_floor",
                 "complement_weight": 1.0,
             },
+            "avg_minsr_svd_history": {
+                # Learning rate settings
+                "schedule_type": "inverse_time",  # constant or inverse_time
+                "learning_rate": 5e-2,
+                "learning_decay_rate": 1e-4,
+                # Averaged-MinSR Tikhonov dual-solve hyperparams
+                "lambda_reg": 0.001,
+                # Damping is used only for SVD-compressed history retention.
+                "damping": 0.001,
+                "constrain_norm": True,
+                "norm_constraint": 0.001,
+                "eta": 0.99,
+                "sr_rank": 10,
+                "sr_rank_max": 100,
+                "sr_scale": 1.1,
+            },
             "gauss_newton": {
                 # Learning rate settings
                 "schedule_type": "inverse_time",  # constant or inverse_time

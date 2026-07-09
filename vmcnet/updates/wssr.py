@@ -54,6 +54,16 @@ class WSSRSVDResult(NamedTuple):
     active_rank: Array
 
 
+class AvgMinSRSVDHistoryResult(NamedTuple):
+    """Result of one averaged-MinSR SVD-history core update."""
+
+    grad_like_update: Array
+    state: WSSRCoreState
+    active_rank: Array
+    dual_matrix_cond: Array
+    update_norm: Array
+
+
 class WSSROptimizerState(NamedTuple):
     """Integrated WSSR optimizer state."""
 
@@ -544,6 +554,30 @@ def _update_metrics_with_wssr_rank_diagnostics(
     return metrics
 
 
+def _update_metrics_with_avg_minsr_diagnostics(
+    metrics,
+    result: AvgMinSRSVDHistoryResult,
+    lambda_reg: chex.Numeric,
+):
+    """Add averaged-MinSR SVD-history diagnostics to metrics."""
+    metric_dtype = result.state.sr_rank.dtype
+    metrics.update(
+        {
+            "avg_minsr_active_rank": jnp.asarray(
+                result.active_rank, dtype=metric_dtype
+            ),
+            "avg_minsr_sr_rank": result.state.sr_rank,
+            "avg_minsr_sr_rank0": result.state.sr_rank0,
+            "avg_minsr_lambda_reg": jnp.asarray(
+                lambda_reg, dtype=result.update_norm.dtype
+            ),
+            "avg_minsr_dual_matrix_cond": result.dual_matrix_cond,
+            "avg_minsr_update_norm": result.update_norm,
+        }
+    )
+    return metrics
+
+
 def _update_working_rank(active_rank: Array, sr_rank: Array, sr_rank_max: int, sr_scale):
     capped_sr_rank = jnp.minimum(
         sr_rank,
@@ -817,6 +851,123 @@ def wssr_svd_core_update(
         constrain_update_norm,
         eps=eps,
     )
+
+
+def avg_minsr_svd_history_core_update(
+    o_aug: Array,
+    e_aug: Array,
+    state: WSSRCoreState,
+    lambda_reg: chex.Numeric,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    constrain_update_norm: bool = True,
+    eps: chex.Numeric = 1e-12,
+) -> AvgMinSRSVDHistoryResult:
+    """Compute averaged-MinSR with SVD-compressed WSSR-style history.
+
+    This ablation baseline uses a Tikhonov dual solve for the update direction:
+    ``A @ solve(A.T @ A + lambda_reg * I, b)``. The SVD is used only to update
+    the compressed history buffers with the same retained-rank rule as WSSR.
+    """
+    width = o_aug.shape[1]
+    safe_lambda = jnp.maximum(
+        jnp.asarray(lambda_reg, dtype=o_aug.dtype),
+        jnp.asarray(eps, dtype=o_aug.dtype),
+    )
+    gram = o_aug.T @ o_aug
+    regularized_gram = gram + safe_lambda * jnp.eye(width, dtype=o_aug.dtype)
+    alpha = jnp.linalg.solve(regularized_gram, e_aug)
+    grad_like_update = o_aug @ alpha
+    raw_update_norm = jnp.linalg.norm(grad_like_update)
+    if constrain_update_norm:
+        grad_like_update = constrain_norm(grad_like_update, norm_constraint, eps=eps)
+
+    if width == 0 or o_aug.shape[0] == 0:
+        zero_state = _zero_history_like(state)
+        return AvgMinSRSVDHistoryResult(
+            grad_like_update,
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+            jnp.asarray(1.0, dtype=o_aug.dtype),
+            raw_update_norm,
+        )
+
+    u, singular_values, vh = jnp.linalg.svd(o_aug, full_matrices=False)
+    if singular_values.shape[0] == 0:
+        zero_state = _zero_history_like(state)
+        return AvgMinSRSVDHistoryResult(
+            grad_like_update,
+            zero_state,
+            jnp.asarray(0, dtype=state.sr_rank.dtype),
+            jnp.asarray(1.0, dtype=o_aug.dtype),
+            raw_update_norm,
+        )
+
+    leading_sv = singular_values[0]
+    valid_leading = leading_sv > eps
+    safe_leading_sv = jnp.where(valid_leading, leading_sv, 1.0)
+    rank_capacity = min(singular_values.shape[0], state.sr_o.shape[1], sr_rank_max)
+    target_rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(rank_capacity, dtype=state.sr_rank.dtype),
+    )
+    rank_mask = jnp.arange(singular_values.shape[0]) < target_rank
+    retained = (
+        (singular_values / safe_leading_sv > damping) & valid_leading & rank_mask
+    )
+    active_rank = jnp.sum(retained.astype(state.sr_rank.dtype))
+    valid_history = valid_leading & (active_rank > 0)
+    retained_float = retained.astype(o_aug.dtype)
+
+    sr_o = jnp.zeros_like(state.sr_o)
+    ek = jnp.zeros_like(state.ek)
+    history_width = rank_capacity
+    sr_o_values = (
+        u[:, :history_width]
+        * singular_values[:history_width]
+        * retained_float[:history_width]
+    )
+    ek_values = (vh[:history_width, :] @ e_aug) * retained_float[:history_width]
+    sr_o = sr_o.at[:, :history_width].set(sr_o_values)
+    ek = ek.at[:history_width].set(ek_values)
+
+    updated_sr_rank = _update_working_rank(
+        active_rank, state.sr_rank, sr_rank_max, sr_scale
+    )
+    capped_sr_rank = jnp.minimum(
+        state.sr_rank,
+        jnp.asarray(sr_rank_max, dtype=state.sr_rank.dtype),
+    )
+    new_sr_rank = jnp.where(valid_history, updated_sr_rank, capped_sr_rank)
+    new_state = WSSRCoreState(
+        sr_o=jnp.where(valid_history, sr_o, jnp.zeros_like(sr_o)),
+        ek=jnp.where(valid_history, ek, jnp.zeros_like(ek)),
+        sr_rank0=jnp.where(
+            valid_history, active_rank, jnp.asarray(0, dtype=state.sr_rank0.dtype)
+        ),
+        sr_rank=new_sr_rank,
+    )
+
+    regularized_spectrum = jnp.square(singular_values) + safe_lambda
+    max_eig = jnp.max(regularized_spectrum)
+    min_eig = jnp.min(regularized_spectrum)
+    min_eig = jnp.where(width > singular_values.shape[0], safe_lambda, min_eig)
+    dual_matrix_cond = max_eig / jnp.maximum(min_eig, eps)
+    return AvgMinSRSVDHistoryResult(
+        grad_like_update,
+        new_state,
+        active_rank,
+        dual_matrix_cond,
+        raw_update_norm,
+    )
+
+
+_jitted_avg_minsr_svd_history_core_update = jax.jit(
+    avg_minsr_svd_history_core_update,
+    static_argnames=("sr_rank_max", "constrain_update_norm"),
+)
 
 
 def randomized_svd(
@@ -1427,6 +1578,48 @@ def compute_wssr_svd_core_update(
     return unravel_fn(result.grad_like_update), result.state, result.active_rank
 
 
+def compute_avg_minsr_svd_history_core_update(
+    log_psi_apply: ModelApply[P],
+    params: P,
+    positions: Array,
+    local_energies: Array,
+    energy: Array,
+    state: WSSRCoreState,
+    eta: chex.Numeric,
+    lambda_reg: chex.Numeric,
+    damping: chex.Numeric,
+    norm_constraint: chex.Numeric,
+    sr_rank_max: int,
+    sr_scale: chex.Numeric = 1.1,
+    constrain_update_norm: bool = True,
+) -> Tuple[P, AvgMinSRSVDHistoryResult]:
+    """Compute averaged-MinSR SVD-history update and unflatten it."""
+    o_cur, unravel_fn = center_and_scale_score_matrix(
+        log_psi_apply, params, positions
+    )
+    e_cur = center_and_scale_energy_residuals(local_energies, energy)
+    o_aug, e_aug = augment_wssr_system(o_cur, e_cur, state, eta)
+    result = _jitted_avg_minsr_svd_history_core_update(
+        o_aug,
+        e_aug,
+        state,
+        lambda_reg,
+        damping,
+        norm_constraint,
+        sr_rank_max,
+        sr_scale=sr_scale,
+        constrain_update_norm=constrain_update_norm,
+    )
+    result = AvgMinSRSVDHistoryResult(
+        unravel_fn(result.grad_like_update),
+        result.state,
+        result.active_rank,
+        result.dual_matrix_cond,
+        result.update_norm,
+    )
+    return result.grad_like_update, result
+
+
 def compute_wssr_sketch_core_update(
     log_psi_apply: ModelApply[P],
     params: P,
@@ -2002,6 +2195,120 @@ def construct_wssr_warm_svd_right_matfree_update_param_fn(
         )
 
     return update_param_fn
+
+
+def construct_avg_minsr_svd_history_update_param_fn(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    optimizer: optax.GradientTransformation,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+) -> UpdateParamFn[P, D, WSSROptimizerState]:
+    """Create the integrated SVD-compressed averaged-MinSR update function."""
+    if optimizer_config.lambda_reg < 0:
+        raise ValueError("lambda_reg must be nonnegative")
+
+    def update_param_fn(params, data, optimizer_state, key):
+        position = get_position_fn(data)
+        energy, local_energies, stats = energy_and_statistics_fn(params, position)
+
+        grad_like_update, result = compute_avg_minsr_svd_history_core_update(
+            log_psi_apply,
+            params,
+            position,
+            local_energies,
+            energy,
+            optimizer_state.core_state,
+            optimizer_config.eta,
+            optimizer_config.lambda_reg,
+            optimizer_config.damping,
+            optimizer_config.norm_constraint,
+            optimizer_config.sr_rank_max,
+            sr_scale=optimizer_config.sr_scale,
+            constrain_update_norm=False,
+        )
+
+        updates, optax_state = optimizer.update(
+            grad_like_update, optimizer_state.optax_state, params
+        )
+        if optimizer_config.constrain_norm:
+            updates = constrain_update_tree_norm(
+                updates, optimizer_config.norm_constraint
+            )
+        params = optax.apply_updates(params, updates)
+        data = update_data_fn(data, params)
+
+        metrics = {"energy": energy, "variance": stats["variance"]}
+        metrics = update_metrics_with_noclip(
+            stats["energy_noclip"],
+            stats["variance_noclip"],
+            metrics,
+        )
+        metrics = _update_metrics_with_avg_minsr_diagnostics(
+            metrics,
+            result,
+            optimizer_config.lambda_reg,
+        )
+        if record_param_l1_norm:
+            metrics.update({"param_l1_norm": tree_reduce_l1(params)})
+
+        return (
+            params,
+            data,
+            WSSROptimizerState(
+                core_state=result.state,
+                optax_state=optax_state,
+            ),
+            metrics,
+            key,
+        )
+
+    return jax.jit(update_param_fn)
+
+
+def initialize_avg_minsr_svd_history(
+    log_psi_apply: ModelApply[P],
+    energy_and_statistics_fn,
+    params: P,
+    get_position_fn: GetPositionFromData[D],
+    update_data_fn: UpdateDataFn[D, P],
+    learning_rate_schedule: LearningRateSchedule,
+    optimizer_config: ConfigDict,
+    record_param_l1_norm: bool = False,
+    apply_pmap: bool = True,
+) -> Tuple[UpdateParamFn[P, D, WSSROptimizerState], WSSROptimizerState]:
+    """Get an update function and initial state for averaged-MinSR SVD history."""
+    if apply_pmap:
+        raise NotImplementedError(
+            "avg_minsr_svd_history currently supports apply_pmap=False only"
+        )
+
+    flat_params, _ = jax.flatten_util.ravel_pytree(params)
+    core_state = initialize_wssr_core_state(
+        flat_params.shape[0],
+        optimizer_config.sr_rank,
+        optimizer_config.sr_rank_max,
+        dtype=flat_params.dtype,
+    )
+    optimizer = optax.sgd(
+        learning_rate=learning_rate_schedule, momentum=0, nesterov=False
+    )
+    optax_state = optimizer.init(params)
+    update_param_fn = construct_avg_minsr_svd_history_update_param_fn(
+        log_psi_apply,
+        energy_and_statistics_fn,
+        optimizer,
+        get_position_fn,
+        update_data_fn,
+        optimizer_config,
+        record_param_l1_norm=record_param_l1_norm,
+    )
+    return (
+        update_param_fn,
+        WSSROptimizerState(core_state=core_state, optax_state=optax_state),
+    )
 
 
 def initialize_wssr_svd(

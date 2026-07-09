@@ -208,6 +208,51 @@ def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_accepts_avg_minsr_svd_history_optimizer_type(mocker):
+    """Test that the averaged-MinSR SVD-history optimizer is a visible option."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        ["vmcnet", "--config.vmc.optimizer_type=avg_minsr_svd_history"],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "avg_minsr_svd_history"
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
+def test_parse_config_overrides_avg_minsr_svd_history_fields(mocker):
+    """Test command-line overrides for averaged-MinSR SVD-history fields."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        [
+            "vmcnet",
+            "--config.vmc.optimizer_type=avg_minsr_svd_history",
+            "--config.vmc.optimizer.avg_minsr_svd_history.learning_rate=0.02",
+            "--config.vmc.optimizer.avg_minsr_svd_history.lambda_reg=0.005",
+            "--config.vmc.optimizer.avg_minsr_svd_history.damping=0.002",
+            "--config.vmc.optimizer.avg_minsr_svd_history.sr_rank=12",
+            "--config.vmc.optimizer.avg_minsr_svd_history.sr_rank_max=80",
+            "--config.vmc.optimizer.avg_minsr_svd_history.eta=0.95",
+        ],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "avg_minsr_svd_history"
+    expected_config.vmc.optimizer.avg_minsr_svd_history.learning_rate = 0.02
+    expected_config.vmc.optimizer.avg_minsr_svd_history.lambda_reg = 0.005
+    expected_config.vmc.optimizer.avg_minsr_svd_history.damping = 0.002
+    expected_config.vmc.optimizer.avg_minsr_svd_history.sr_rank = 12
+    expected_config.vmc.optimizer.avg_minsr_svd_history.sr_rank_max = 80
+    expected_config.vmc.optimizer.avg_minsr_svd_history.eta = 0.95
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_setting_duplicated_config_flag_sets_only_desired_flag(mocker):
     """Test changing normal_init.type only affects the desired instance of the flag.
 
