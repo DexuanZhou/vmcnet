@@ -327,6 +327,7 @@ def get_default_vmc_config() -> Dict:
                 "svd_maxiter_initial": 8,
                 "svd_maxiter_warm": 2,
                 "svd_working_rank": -1,
+                "store_warm_u": True,
             },
             "wssr_warm_svd_right": {
                 # Learning rate settings
@@ -347,6 +348,7 @@ def get_default_vmc_config() -> Dict:
                 "svd_working_rank": -1,
                 "spectral_regularization": "hard_floor",
                 "complement_weight": 1.0,
+                "store_warm_u": True,
             },
             "wssr_warm_svd_right_matfree": {
                 # Learning rate settings
@@ -367,6 +369,7 @@ def get_default_vmc_config() -> Dict:
                 "svd_working_rank": -1,
                 "spectral_regularization": "hard_floor",
                 "complement_weight": 1.0,
+                "store_warm_u": True,
             },
             "avg_minsr_svd_history": {
                 # Learning rate settings

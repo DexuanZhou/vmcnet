@@ -210,6 +210,7 @@ def test_default_config_contains_wssr_warm_svd():
     assert config.vmc.optimizer.wssr_warm_svd.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd.svd_maxiter_warm == 2
     assert config.vmc.optimizer.wssr_warm_svd.svd_working_rank == -1
+    assert config.vmc.optimizer.wssr_warm_svd.store_warm_u is True
 
 
 def test_default_config_contains_wssr_warm_svd_right():
@@ -226,6 +227,7 @@ def test_default_config_contains_wssr_warm_svd_right():
         "hard_floor"
     )
     assert config.vmc.optimizer.wssr_warm_svd_right.complement_weight == 1.0
+    assert config.vmc.optimizer.wssr_warm_svd_right.store_warm_u is True
 
 
 def test_default_config_contains_wssr_warm_svd_right_matfree():
@@ -242,6 +244,7 @@ def test_default_config_contains_wssr_warm_svd_right_matfree():
         "hard_floor"
     )
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.complement_weight == 1.0
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.store_warm_u is True
 
 
 def test_center_and_scale_score_matrix_uses_julia_convention():
@@ -1906,6 +1909,134 @@ def test_initialize_wssr_warm_svd_rejects_pmap_until_jit_safe_core_exists():
         raise AssertionError("Expected wssr_warm_svd to reject apply_pmap=True")
 
 
+def test_initialize_wssr_warm_svd_core_state_store_warm_u_shapes():
+    full_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4,
+        sr_rank=2,
+        sr_rank_max=5,
+        dtype=jnp.float32,
+        store_warm_u=True,
+    )
+    derived_state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=4,
+        sr_rank=2,
+        sr_rank_max=5,
+        dtype=jnp.float32,
+        store_warm_u=False,
+    )
+
+    assert full_state.u.shape == (4, 5)
+    assert derived_state.u.shape == (4, 0)
+    assert full_state.sr_o.shape == derived_state.sr_o.shape == (4, 5)
+
+
+def test_recover_u_from_sr_o_masks_inactive_and_zero_columns():
+    sr_o = jnp.array(
+        [
+            [3.0, 0.0, 1.0, 2.0],
+            [4.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    recovered = wssr.recover_u_from_sr_o(
+        sr_o,
+        sr_rank0=jnp.array(3),
+        rank_capacity=5,
+    )
+
+    expected = jnp.array(
+        [
+            [0.6, 0.0, 1.0, 0.0, 0.0],
+            [0.8, 0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    assert recovered.dtype == sr_o.dtype
+    assert recovered.shape == (2, 5)
+    np.testing.assert_allclose(recovered, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_recover_right_basis_from_sr_o_projection_matches_recovered_u_projection():
+    o_aug = jnp.array(
+        [
+            [1.0, -0.2, 0.3, 0.1],
+            [0.5, 0.4, -0.7, 0.2],
+            [-0.1, 0.8, 0.6, -0.3],
+        ],
+        dtype=jnp.float32,
+    )
+    sr_o = jnp.array(
+        [
+            [3.0, 0.0, 1.0],
+            [4.0, 0.0, -2.0],
+            [0.0, 0.0, 2.0],
+        ],
+        dtype=jnp.float32,
+    )
+    sr_rank0 = jnp.array(2)
+    rank_capacity = 3
+
+    recovered_u = wssr.recover_u_from_sr_o(sr_o, sr_rank0, rank_capacity)
+    expected = o_aug.T @ recovered_u
+    projection = wssr.recover_right_basis_from_sr_o_projection(
+        o_aug,
+        sr_o,
+        sr_rank0,
+        rank_capacity,
+    )
+
+    assert projection.shape == (o_aug.shape[1], rank_capacity)
+    np.testing.assert_allclose(projection, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_right_warm_start_svd_recovers_left_basis_without_persistent_u():
+    o_aug = jnp.array(
+        [
+            [1.0, 0.2, 0.0, 0.1],
+            [0.0, 1.0, 0.3, 0.2],
+            [0.2, 0.0, 1.0, 0.4],
+        ],
+        dtype=jnp.float32,
+    )
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        num_params=3,
+        sr_rank=2,
+        sr_rank_max=3,
+        dtype=jnp.float32,
+        store_warm_u=False,
+    )._replace(
+        sr_o=jnp.array(
+            [
+                [3.0, 0.0, 0.0],
+                [4.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        sr_rank0=jnp.array(2),
+        has_u=jnp.array(False),
+    )
+
+    u, singular_values, vh, rank = wssr.right_warm_start_svd(
+        o_aug,
+        state,
+        key=jax.random.PRNGKey(3),
+        maxiter_initial=2,
+        maxiter_warm=1,
+        svd_working_rank=2,
+    )
+
+    assert state.u.shape == (3, 0)
+    assert u.shape == (3, 2)
+    assert singular_values.shape == (2,)
+    assert vh.shape == (2, 4)
+    assert rank == jnp.asarray(2)
+    assert jnp.all(jnp.isfinite(u))
+    assert jnp.all(jnp.isfinite(singular_values))
+    assert jnp.all(jnp.isfinite(vh))
+
+
 def test_wssr_warm_svd_right_uses_left_basis_state_shape():
     right_state = wssr.initialize_wssr_warm_svd_core_state(
         num_params=3, sr_rank=2, sr_rank_max=5, dtype=jnp.float32
@@ -2917,6 +3048,83 @@ def test_wssr_warm_svd_right_integrated_two_updates_have_no_nans():
     assert key_2.shape == key.shape
     assert not np.allclose(key_1, key)
     assert not np.allclose(key_2, key_1)
+
+
+def test_wssr_warm_svd_right_two_step_no_persistent_u_matches_persistent_metrics():
+    params = _tiny_params()
+    data = _tiny_positions()
+
+    def _make_config(store_warm_u):
+        config = default_config.get_default_config()
+        config.vmc.nchains = data.shape[0]
+        config.vmc.optimizer_type = "wssr_warm_svd_right"
+        config.vmc.optimizer.wssr_warm_svd_right.schedule_type = "constant"
+        config.vmc.optimizer.wssr_warm_svd_right.learning_rate = 0.125
+        config.vmc.optimizer.wssr_warm_svd_right.constrain_norm = False
+        config.vmc.optimizer.wssr_warm_svd_right.sr_rank = 2
+        config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max = 5
+        config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank = 3
+        config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial = 2
+        config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm = 1
+        config.vmc.optimizer.wssr_warm_svd_right.store_warm_u = store_warm_u
+        return config
+
+    persistent_update_fn, persistent_state, persistent_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        _make_config(True).vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(11),
+        apply_pmap=False,
+    )
+    derived_update_fn, derived_state, derived_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        _make_config(False).vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(11),
+        apply_pmap=False,
+    )
+
+    persistent_params_1, _, persistent_state_1, persistent_metrics_1, persistent_key_1 = (
+        persistent_update_fn(params, data, persistent_state, persistent_key)
+    )
+    derived_params_1, _, derived_state_1, derived_metrics_1, derived_key_1 = (
+        derived_update_fn(params, data, derived_state, derived_key)
+    )
+    persistent_params_2, _, persistent_state_2, persistent_metrics_2, _ = (
+        persistent_update_fn(
+            persistent_params_1, data, persistent_state_1, persistent_key_1
+        )
+    )
+    derived_params_2, _, derived_state_2, derived_metrics_2, _ = derived_update_fn(
+        derived_params_1, data, derived_state_1, derived_key_1
+    )
+
+    _assert_tree_all_finite(persistent_params_2)
+    _assert_tree_all_finite(derived_params_2)
+    _assert_wssr_state_all_finite(persistent_state_2.core_state)
+    _assert_wssr_state_all_finite(derived_state_2.core_state)
+    assert persistent_state_2.core_state.u.shape == (3, 5)
+    assert derived_state_2.core_state.u.shape == (3, 0)
+    assert derived_state_2.core_state.sr_o.shape == persistent_state_2.core_state.sr_o.shape
+    assert set(persistent_metrics_1).issuperset({"energy", "variance", "energy_noclip"})
+    assert set(derived_metrics_1).issuperset({"energy", "variance", "energy_noclip"})
+    for key in ("energy", "variance", "energy_noclip"):
+        np.testing.assert_allclose(
+            derived_metrics_1[key], persistent_metrics_1[key], rtol=1e-6, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            derived_metrics_2[key], persistent_metrics_2[key], rtol=1e-6, atol=1e-6
+        )
 
 
 def test_initialize_wssr_warm_svd_right_rejects_pmap_until_jit_safe_core_exists():

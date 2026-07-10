@@ -71,6 +71,92 @@ class WSSROptimizerState(NamedTuple):
     optax_state: optax.OptState
 
 
+def recover_u_from_sr_o(
+    sr_o: Array,
+    sr_rank0: Array,
+    rank_capacity: int,
+    eps: chex.Numeric = 1e-12,
+) -> Array:
+    """Recover a normalized warm left basis from stored WSSR score history."""
+    if rank_capacity < 0:
+        raise ValueError("rank_capacity must be nonnegative")
+
+    recovered = jnp.zeros((sr_o.shape[0], rank_capacity), dtype=sr_o.dtype)
+    history_width = min(sr_o.shape[1], rank_capacity)
+    sr_o_active = sr_o[:, :history_width]
+    column_norms = jnp.linalg.norm(sr_o_active, axis=0, keepdims=True)
+    eps_array = jnp.asarray(eps, dtype=sr_o.dtype)
+    safe_norms = jnp.maximum(column_norms, eps_array)
+    active_columns = jnp.arange(history_width) < sr_rank0
+    nonzero_columns = column_norms[0] > eps_array
+    column_mask = active_columns & nonzero_columns
+    u_active = sr_o_active / safe_norms
+    u_active = jnp.where(column_mask[None, :], u_active, jnp.zeros_like(u_active))
+    return recovered.at[:, :history_width].set(u_active)
+
+
+def recover_right_basis_from_sr_o_projection(
+    o_aug: Array,
+    sr_o: Array,
+    sr_rank0: Array,
+    rank_capacity: int,
+    eps: chex.Numeric = 1e-12,
+) -> Array:
+    """Project recovered WSSR history directions into right space without forming U."""
+    if rank_capacity < 0:
+        raise ValueError("rank_capacity must be nonnegative")
+
+    recovered_projection = jnp.zeros(
+        (o_aug.shape[1], rank_capacity), dtype=o_aug.dtype
+    )
+    history_width = min(sr_o.shape[1], rank_capacity)
+    sr_o_active = sr_o[:, :history_width]
+    column_norms = jnp.linalg.norm(sr_o_active, axis=0)
+    eps_array = jnp.asarray(eps, dtype=sr_o.dtype)
+    active_columns = jnp.arange(history_width) < sr_rank0
+    nonzero_columns = column_norms > eps_array
+    inv_norms = jnp.where(
+        active_columns & nonzero_columns,
+        1.0 / jnp.maximum(column_norms, eps_array),
+        jnp.zeros_like(column_norms),
+    )
+    projection = (o_aug.T @ sr_o_active) * inv_norms[None, :]
+    return recovered_projection.at[:, :history_width].set(projection)
+
+
+def _slice_or_zero_pad_columns(matrix: Array, rank_capacity: int) -> Array:
+    padded = jnp.zeros((matrix.shape[0], rank_capacity), dtype=matrix.dtype)
+    width = min(matrix.shape[1], rank_capacity)
+    return padded.at[:, :width].set(matrix[:, :width])
+
+
+def _select_warm_left_basis(
+    state: WSSRWarmSVDCoreState,
+    rank_capacity: int,
+    eps: chex.Numeric = 1e-12,
+) -> Tuple[Array, Array]:
+    """Choose stored warm ``u`` when available, otherwise derive it from ``sr_o``."""
+    recovered_u = recover_u_from_sr_o(
+        state.sr_o,
+        state.sr_rank0,
+        rank_capacity,
+        eps=eps,
+    )
+    if state.u.shape[1] > 0:
+        stored_u = _slice_or_zero_pad_columns(state.u, rank_capacity)
+        warm_u = jax.lax.cond(
+            state.has_u,
+            lambda _: stored_u,
+            lambda _: recovered_u,
+            operand=None,
+        )
+        has_warm_u = state.has_u | (state.sr_rank0 > 0)
+    else:
+        warm_u = recovered_u
+        has_warm_u = state.sr_rank0 > 0
+    return warm_u, has_warm_u
+
+
 def initialize_wssr_core_state(
     num_params: int,
     sr_rank: int,
@@ -97,15 +183,17 @@ def initialize_wssr_warm_svd_core_state(
     sr_rank: int,
     sr_rank_max: int,
     dtype=jnp.float32,
+    store_warm_u: bool = True,
 ) -> WSSRWarmSVDCoreState:
     """Initialize WSSR history plus fixed-shape warm-SVD subspace."""
     core_state = initialize_wssr_core_state(num_params, sr_rank, sr_rank_max, dtype)
+    u_width = sr_rank_max if store_warm_u else 0
     return WSSRWarmSVDCoreState(
         sr_o=core_state.sr_o,
         ek=core_state.ek,
         sr_rank0=core_state.sr_rank0,
         sr_rank=core_state.sr_rank,
-        u=jnp.zeros((num_params, sr_rank_max), dtype=dtype),
+        u=jnp.zeros((num_params, u_width), dtype=dtype),
         has_u=jnp.array(False),
     )
 
@@ -1139,6 +1227,7 @@ def warm_start_svd(
     maxiter_initial: int,
     maxiter_warm: int,
     svd_working_rank: Optional[int] = None,
+    eps: chex.Numeric = 1e-12,
 ) -> Tuple[Array, Array, Array, Array]:
     """Compute a warm-start subspace-iteration SVD approximation."""
     if maxiter_initial < 0:
@@ -1146,10 +1235,11 @@ def warm_start_svd(
     if maxiter_warm < 0:
         raise ValueError("maxiter_warm must be nonnegative")
 
-    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    storage_width = state.sr_o.shape[1]
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, storage_width)
     rank_capacity = min(
         working_rank_max,
-        state.u.shape[1],
+        storage_width,
         o_aug.shape[0],
         o_aug.shape[1],
     )
@@ -1178,8 +1268,14 @@ def warm_start_svd(
             u = _masked_qr(y)
         return u
 
+    warm_u, has_warm_u = _select_warm_left_basis(
+        state,
+        rank_capacity,
+        eps=eps,
+    )
+
     def _warm_branch(_):
-        u0 = state.u[:, :rank_capacity] * rank_mask
+        u0 = warm_u * rank_mask
         u, _ = jnp.linalg.qr(u0, mode="reduced")
         u = u * rank_mask
         return _subspace_iterate(u, maxiter_warm)
@@ -1193,7 +1289,7 @@ def warm_start_svd(
         u = _masked_qr(y)
         return _subspace_iterate(u, maxiter_initial)
 
-    u = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
+    u = jax.lax.cond(has_warm_u, _warm_branch, _initial_branch, operand=None)
     b = u.T @ o_aug
     u_hat, singular_values, vh = jnp.linalg.svd(b, full_matrices=False)
     factor_mask = (jnp.arange(singular_values.shape[0]) < rank).astype(o_aug.dtype)
@@ -1224,10 +1320,11 @@ def right_warm_start_svd(
     if maxiter_warm < 0:
         raise ValueError("maxiter_warm must be nonnegative")
 
-    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    storage_width = state.sr_o.shape[1]
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, storage_width)
     rank_capacity = min(
         working_rank_max,
-        state.u.shape[1],
+        storage_width,
         o_aug.shape[0],
         o_aug.shape[1],
     )
@@ -1257,8 +1354,23 @@ def right_warm_start_svd(
         return v
 
     def _warm_branch(_):
-        u0 = state.u[:, :rank_capacity] * rank_mask
-        v = _masked_qr(o_aug.T @ u0)
+        if state.u.shape[1] > 0:
+            warm_u, _ = _select_warm_left_basis(
+                state,
+                rank_capacity,
+                eps=eps,
+            )
+            projection = o_aug.T @ (warm_u * rank_mask)
+        else:
+            projection = recover_right_basis_from_sr_o_projection(
+                o_aug,
+                state.sr_o,
+                state.sr_rank0,
+                rank_capacity,
+                eps=eps,
+            )
+            projection = projection * rank_mask
+        v = _masked_qr(projection)
         return _subspace_iterate(v, maxiter_warm)
 
     def _initial_branch(_):
@@ -1269,7 +1381,8 @@ def right_warm_start_svd(
         v = _masked_qr(omega)
         return _subspace_iterate(v, maxiter_initial)
 
-    v = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
+    has_warm_u = state.has_u | (state.sr_rank0 > 0)
+    v = jax.lax.cond(has_warm_u, _warm_branch, _initial_branch, operand=None)
     y = o_aug @ v
     gram = y.T @ y
     eigvals, right_rot = jnp.linalg.eigh(gram)
@@ -1311,10 +1424,11 @@ def right_warm_start_svd_matfree(
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
     num_params = flat_params.shape[0]
     aug_width = state.sr_o.shape[1] + positions.shape[0]
-    working_rank_max = _resolve_svd_working_rank(svd_working_rank, state.u.shape[1])
+    storage_width = state.sr_o.shape[1]
+    working_rank_max = _resolve_svd_working_rank(svd_working_rank, storage_width)
     rank_capacity = min(
         working_rank_max,
-        state.u.shape[1],
+        storage_width,
         num_params,
         aug_width,
     )
@@ -1353,8 +1467,14 @@ def right_warm_start_svd_matfree(
             v = _masked_qr(z)
         return v
 
+    warm_u, has_warm_u = _select_warm_left_basis(
+        state,
+        rank_capacity,
+        eps=eps,
+    )
+
     def _warm_branch(_):
-        u0 = state.u[:, :rank_capacity] * rank_mask
+        u0 = warm_u * rank_mask
         v = _masked_qr(_rmatmat(u0))
         return _subspace_iterate(v, maxiter_warm)
 
@@ -1364,7 +1484,7 @@ def right_warm_start_svd_matfree(
         v = _masked_qr(omega)
         return _subspace_iterate(v, maxiter_initial)
 
-    v = jax.lax.cond(state.has_u, _warm_branch, _initial_branch, operand=None)
+    v = jax.lax.cond(has_warm_u, _warm_branch, _initial_branch, operand=None)
     y = _matmat(v)
     gram = y.T @ y
     eigvals, right_rot = jnp.linalg.eigh(gram)
@@ -1414,6 +1534,7 @@ def wssr_warm_svd_core_update(
         svd_maxiter_initial,
         svd_maxiter_warm,
         svd_working_rank=working_rank_max,
+        eps=eps,
     )
     result = _wssr_update_from_svd(
         o_aug,
@@ -2380,6 +2501,7 @@ def initialize_wssr_warm_svd_right_matfree(
         optimizer_config.sr_rank,
         storage_rank,
         dtype=flat_params.dtype,
+        store_warm_u=optimizer_config.get("store_warm_u", True),
     )
     optimizer = optax.sgd(
         learning_rate=learning_rate_schedule, momentum=0, nesterov=False
@@ -2457,6 +2579,11 @@ def initialize_wssr_warm_svd(
         raise NotImplementedError(
             "wssr_warm_svd currently supports apply_pmap=False only"
         )
+    if not optimizer_config.get("store_warm_u", True):
+        raise NotImplementedError(
+            "wssr_warm_svd with store_warm_u=False is unsupported; use "
+            "wssr_warm_svd_right for zero-width warm-U storage"
+        )
 
     flat_params, _ = jax.flatten_util.ravel_pytree(params)
     core_state = initialize_wssr_warm_svd_core_state(
@@ -2464,6 +2591,7 @@ def initialize_wssr_warm_svd(
         optimizer_config.sr_rank,
         optimizer_config.sr_rank_max,
         dtype=flat_params.dtype,
+        store_warm_u=optimizer_config.get("store_warm_u", True),
     )
     optimizer = optax.sgd(
         learning_rate=learning_rate_schedule, momentum=0, nesterov=False
@@ -2512,6 +2640,7 @@ def initialize_wssr_warm_svd_right(
         optimizer_config.sr_rank,
         storage_rank,
         dtype=flat_params.dtype,
+        store_warm_u=optimizer_config.get("store_warm_u", True),
     )
     optimizer = optax.sgd(
         learning_rate=learning_rate_schedule, momentum=0, nesterov=False

@@ -133,6 +133,26 @@ def test_parse_config_overrides_wssr_warm_svd_right_storage_rank(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_overrides_wssr_warm_svd_right_store_warm_u(mocker):
+    """Test command-line override for disabling persistent right WSSR warm u."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        [
+            "vmcnet",
+            "--config.vmc.optimizer_type=wssr_warm_svd_right",
+            "--config.vmc.optimizer.wssr_warm_svd_right.store_warm_u=False",
+        ],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.optimizer_type = "wssr_warm_svd_right"
+    expected_config.vmc.optimizer.wssr_warm_svd_right.store_warm_u = False
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_parse_config_overrides_wssr_warm_svd_right_regularization(mocker):
     """Test command-line overrides for experimental WSSR spectral regularization."""
     flag_values = flags.FlagValues()
@@ -188,6 +208,7 @@ def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.svd_working_rank=24",
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.spectral_regularization=tikhonov",
             "--config.vmc.optimizer.wssr_warm_svd_right_matfree.complement_weight=0.3",
+            "--config.vmc.optimizer.wssr_warm_svd_right_matfree.store_warm_u=False",
         ],
     )
     expected_config = get_default_config_with_chosen_model("ferminet")
@@ -202,6 +223,7 @@ def test_parse_config_overrides_wssr_warm_svd_right_matfree_fields(mocker):
         "tikhonov"
     )
     expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.complement_weight = 0.3
+    expected_config.vmc.optimizer.wssr_warm_svd_right_matfree.store_warm_u = False
 
     _, config = parse_flags(flag_values)
 
