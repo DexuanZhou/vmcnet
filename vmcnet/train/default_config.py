@@ -232,6 +232,7 @@ def get_default_vmc_config() -> Dict:
         "best_checkpoint_every": 100,
         "checkpoint_dir": "checkpoints",
         "checkpoint_variance_scale": 10,
+        "disable_checkpointing": False,
         "check_for_nans": False,
         "nhistory_max": 200,
         "record_amplitudes": False,

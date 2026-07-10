@@ -68,6 +68,21 @@ def test_parse_config_with_valid_flags_including_tuple(mocker):
     _assert_configs_equal(config, expected_config)
 
 
+def test_parse_config_overrides_disable_checkpointing(mocker):
+    """Test command-line override for disabling VMC checkpoint file writes."""
+    flag_values = flags.FlagValues()
+    mocker.patch(
+        "sys.argv",
+        ["vmcnet", "--config.vmc.disable_checkpointing=True"],
+    )
+    expected_config = get_default_config_with_chosen_model("ferminet")
+    expected_config.vmc.disable_checkpointing = True
+
+    _, config = parse_flags(flag_values)
+
+    _assert_configs_equal(config, expected_config)
+
+
 def test_parse_config_accepts_wssr_sketch_optimizer_type(mocker):
     """Test that wssr_sketch is accepted as a visible optimizer option."""
     flag_values = flags.FlagValues()

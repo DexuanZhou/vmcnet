@@ -132,6 +132,82 @@ def test_save_best_checkpoint(mocker):
     )
 
 
+def test_initialize_checkpointing_disabled_does_not_create_checkpoint_dir(tmp_path):
+    log_dir = tmp_path / "run"
+
+    checkpoint_dir, _, _, _ = checkpoint.initialize_checkpointing(
+        "checkpoints",
+        nhistory_max=10,
+        logdir=str(log_dir),
+        checkpoint_every=1,
+        disable_checkpointing=True,
+    )
+
+    assert checkpoint_dir == "checkpoints"
+    assert log_dir.exists()
+    assert not (log_dir / "checkpoints").exists()
+
+
+def test_initialize_checkpointing_default_creates_checkpoint_dir(tmp_path):
+    log_dir = tmp_path / "run"
+
+    checkpoint_dir, _, _, _ = checkpoint.initialize_checkpointing(
+        "checkpoints",
+        nhistory_max=10,
+        logdir=str(log_dir),
+        checkpoint_every=1,
+    )
+
+    assert checkpoint_dir == "checkpoints"
+    assert (log_dir / "checkpoints").exists()
+
+
+def test_disabled_checkpointing_writes_metrics_without_checkpoint_saves(mocker):
+    log_dir, checkpoint_dir_name, _ = _get_fake_filepaths()
+    (_, data, params, opt_state, key) = _get_fake_checkpoint_data(0)
+    metrics = {"energy": 1.0, "variance": 2.0, "energy_noclip": 1.0, "variance_noclip": 2.0}
+    running_energy_and_variance = checkpoint.RunningEnergyVariance(
+        checkpoint.RunningMetric(50), checkpoint.RunningMetric(50)
+    )
+
+    with checkpoint.CheckpointWriter(is_pmapped=False) as checkpoint_writer:
+        with checkpoint.MetricsWriter() as metrics_writer:
+            mock_save_checkpoint = mocker.patch.object(checkpoint_writer, "save_data")
+            mock_save_metrics = mocker.patch.object(metrics_writer, "save_data")
+
+            checkpoint_metric, checkpoint_str, best_checkpoint_data, nans_detected = (
+                checkpoint.save_metrics_and_handle_checkpoints(
+                    epoch=0,
+                    old_params=params,
+                    new_params=params,
+                    optimizer_state=opt_state,
+                    old_data=data,
+                    new_data=data,
+                    key=key,
+                    metrics=metrics,
+                    nchains=10,
+                    running_energy_and_variance=running_energy_and_variance,
+                    checkpoint_writer=checkpoint_writer,
+                    metrics_writer=metrics_writer,
+                    checkpoint_metric=jnp.inf,
+                    logdir=log_dir,
+                    checkpoint_every=1,
+                    best_checkpoint_every=1,
+                    best_checkpoint_data=_get_fake_checkpoint_data(0),
+                    checkpoint_dir=checkpoint_dir_name,
+                    check_for_nans=True,
+                    disable_checkpointing=True,
+                )
+            )
+
+    assert checkpoint_metric == jnp.inf
+    assert checkpoint_str == ""
+    assert best_checkpoint_data is None
+    assert nans_detected == jnp.array(False)
+    mock_save_metrics.assert_called_once_with(log_dir, "", metrics)
+    mock_save_checkpoint.assert_not_called()
+
+
 def test_metrics_saved_to_their_own_files(mocker):
     """Test that appending metrics to files is called properly from a MetricsWriter."""
     directory = "/fake/directory"

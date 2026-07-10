@@ -100,6 +100,7 @@ def vmc_loop(
     best_checkpoint_every: Optional[int] = 100,
     checkpoint_dir: str = "checkpoints",
     checkpoint_variance_scale: float = 10.0,
+    disable_checkpointing: bool = False,
     check_for_nans: bool = False,
     record_amplitudes: bool = False,
     get_amplitude_fn: Optional[GetAmplitudeFromData[D]] = None,
@@ -171,9 +172,16 @@ def vmc_loop(
         running_energy_and_variance,
         best_checkpoint_data,
     ) = utils.checkpoint.initialize_checkpointing(
-        checkpoint_dir, nhistory_max, logdir, checkpoint_every
+        checkpoint_dir,
+        nhistory_max,
+        logdir,
+        checkpoint_every,
+        disable_checkpointing=disable_checkpointing,
     )
     nans_detected = False
+    checkpointing_disabled = utils.checkpoint.checkpointing_disabled(
+        disable_checkpointing
+    )
 
     MAX_WANDB_LOGS = 10000
     wandb_freq = nepochs // min(max(nepochs, 1), MAX_WANDB_LOGS)
@@ -192,10 +200,16 @@ def vmc_loop(
             # 2. To ensure a fully consistent state can be reloaded from a checkpoint, &
             # the exact subsequent behavior can be reproduced (if run on same machine).
             # NOTE: jax deletes the old arrays if we don't make copies.
-            old_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-            old_state = jax.tree_util.tree_map(lambda x: x.copy(), optimizer_state)
-            old_data = data.copy()
-            old_key = key.copy()
+            if checkpointing_disabled:
+                old_params = params
+                old_state = optimizer_state
+                old_data = data
+                old_key = key
+            else:
+                old_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
+                old_state = jax.tree_util.tree_map(lambda x: x.copy(), optimizer_state)
+                old_data = data.copy()
+                old_key = key.copy()
 
             accept_ratio, data, key = walker_fn(params, data, key)
 
@@ -252,6 +266,7 @@ def vmc_loop(
                 check_for_nans=check_for_nans,
                 record_amplitudes=record_amplitudes,
                 get_amplitude_fn=get_amplitude_fn,
+                disable_checkpointing=disable_checkpointing,
             )
             _append_training_metrics_csv_row(logdir, epoch, metrics)
             utils.checkpoint.log_vmc_loop_state(epoch, metrics, checkpoint_str)
@@ -263,7 +278,10 @@ def vmc_loop(
                 break
 
         utils.checkpoint.finish_checkpointing(
-            checkpoint_writer, best_checkpoint_data, logdir
+            checkpoint_writer,
+            best_checkpoint_data,
+            logdir,
+            disable_checkpointing=disable_checkpointing,
         )
 
     return params, optimizer_state, data, key, nans_detected

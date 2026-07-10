@@ -34,6 +34,16 @@ BEST_CHECKPOINT_FILE_NAME = "best_checkpoint.npz"
 DEFAULT_CHECKPOINT_FILE_NAME = "best_checkpoint.npz"
 
 
+def checkpointing_disabled_by_env() -> bool:
+    """Return whether checkpoint file writes are disabled for temporary diagnostics."""
+    return os.environ.get("VMCNET_DISABLE_CHECKPOINTS") == "1"
+
+
+def checkpointing_disabled(disable_checkpointing: bool = False) -> bool:
+    """Return whether checkpoint file writes should be disabled."""
+    return disable_checkpointing or checkpointing_disabled_by_env()
+
+
 @dataclass
 class RunningMetric:
     """Running history and average of a metric for checkpointing purposes.
@@ -204,6 +214,7 @@ def initialize_checkpointing(
     nhistory_max: int,
     logdir: Optional[str] = None,
     checkpoint_every: Optional[int] = None,
+    disable_checkpointing: bool = False,
 ) -> Tuple[str, chex.Numeric, RunningEnergyVariance, Optional[CheckpointData]]:
     """Initialize checkpointing objects.
 
@@ -216,7 +227,9 @@ def initialize_checkpointing(
     """
     if logdir is not None:
         os.makedirs(logdir, exist_ok=True)
-        if checkpoint_every is not None:
+        if checkpoint_every is not None and not checkpointing_disabled(
+            disable_checkpointing
+        ):
             checkpoint_dir = io.add_suffix_for_uniqueness(checkpoint_dir, logdir)
             os.makedirs(os.path.join(logdir, checkpoint_dir), exist_ok=False)
 
@@ -238,8 +251,11 @@ def finish_checkpointing(
     checkpoint_writer: CheckpointWriter,
     best_checkpoint_data: Optional[CheckpointData] = None,
     logdir: Optional[str] = None,
+    disable_checkpointing: bool = False,
 ):
     """Save any final checkpoint data to the CheckpointWriter."""
+    if checkpointing_disabled(disable_checkpointing):
+        return
     if logdir is not None and best_checkpoint_data is not None:
         checkpoint_writer.save_data(
             logdir, BEST_CHECKPOINT_FILE_NAME, best_checkpoint_data
@@ -337,6 +353,7 @@ def save_metrics_and_handle_checkpoints(
     check_for_nans: bool = False,
     record_amplitudes: bool = False,
     get_amplitude_fn: Optional[GetAmplitudeFromData[D]] = None,
+    disable_checkpointing: bool = False,
 ) -> Tuple[chex.Numeric, str, Optional[CheckpointData[D, P, S]], bool]:
     """Checkpoint the current state of the VMC loop.
 
@@ -411,6 +428,18 @@ def save_metrics_and_handle_checkpoints(
     _add_amplitude_to_metrics_if_requested(
         metrics, new_data, record_amplitudes, get_amplitude_fn
     )
+
+    if checkpointing_disabled(disable_checkpointing):
+        metrics_writer.save_data(logdir, "", metrics)
+        nans_detected = (
+            _check_for_nans(metrics, new_params) if check_for_nans else False
+        )
+        return (
+            checkpoint_metric,
+            checkpoint_str,
+            None,
+            nans_detected,
+        )
 
     (checkpoint_str, nans_detected) = save_metrics_and_regular_checkpoint(
         epoch,
