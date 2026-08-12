@@ -13,6 +13,7 @@ from vmcnet.mcmc.metropolis import WalkerFn
 from vmcnet.updates.update_param_fns import UpdateParamFn
 from vmcnet.utils.checkpoint import CheckpointWriter, MetricsWriter
 import vmcnet.utils as utils
+from vmcnet.train import burst_diagnostics
 from vmcnet.utils.typing import D, GetAmplitudeFromData, P, PRNGKey, S
 
 
@@ -85,6 +86,22 @@ def _append_training_metrics_csv_row(
             writer.writeheader()
         writer.writerow(row)
 
+    spring_fields = sorted(key for key in metrics if key.startswith("spring_"))
+    if spring_fields:
+        diagnostics_path = os.path.join(logdir, "spring_diagnostics.csv")
+        diagnostics_header = not os.path.exists(diagnostics_path)
+        diagnostics_row = {"epoch": epoch + 1}
+        diagnostics_row.update(
+            {field: _metric_to_float(metrics[field]) for field in spring_fields}
+        )
+        with open(diagnostics_path, "a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(
+                csv_file, fieldnames=("epoch", *spring_fields)
+            )
+            if diagnostics_header:
+                writer.writeheader()
+            writer.writerow(diagnostics_row)
+
 
 def vmc_loop(
     params: P,
@@ -107,6 +124,7 @@ def vmc_loop(
     nhistory_max: int = 200,
     is_pmapped=True,
     start_epoch: int = 0,
+    burst_diagnostics_config: Optional[dict] = None,
 ) -> Tuple[P, S, D, PRNGKey, bool]:
     """Main Variational Monte Carlo loop routine.
 
@@ -237,6 +255,17 @@ def vmc_loop(
                 accept_ratio_history, total_count=smooth_segment_nepochs
             )
             metrics["smooth20_window"] = smooth20_window
+
+            burst_diagnostics.maybe_save_burst(
+                epoch=epoch,
+                logdir=logdir,
+                config=burst_diagnostics_config or {"enabled": False},
+                metrics=metrics,
+                params=old_params,
+                optimizer_state=old_state,
+                data=data,
+                key=key,
+            )
 
             (
                 checkpoint_metric,

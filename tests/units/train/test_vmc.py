@@ -167,6 +167,22 @@ def test_vmc_loop_writes_training_metrics_csv(tmp_path):
     assert float(last_row["accept_smooth20"]) == pytest.approx(0.5)
 
 
+def test_training_writer_preserves_spring_diagnostics(tmp_path):
+    metrics = {
+        "energy": jnp.asarray([[-109.5]]),
+        "variance": jnp.asarray([[2.0]]),
+        "spring_diag_history_norm": jnp.asarray([[3.25]]),
+        "spring_spec_low_rhs_fraction": jnp.asarray([[0.125]]),
+    }
+    train.vmc._append_training_metrics_csv_row(str(tmp_path), 0, metrics)
+    with (tmp_path / "spring_diagnostics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert int(rows[0]["epoch"]) == 1
+    assert float(rows[0]["spring_diag_history_norm"]) == pytest.approx(3.25)
+    assert float(rows[0]["spring_spec_low_rhs_fraction"]) == pytest.approx(0.125)
+
+
 @pytest.mark.slow
 def test_vmc_loop_number_of_updates():
     """Test number of updates.

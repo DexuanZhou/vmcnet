@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --job-name=N2-adcomp50k-col
+#SBATCH --account=def-ortner
+#SBATCH --time=00:20:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=/scratch/dexuan1/runs/logs/%x-%j.out
+#SBATCH --error=/scratch/dexuan1/runs/logs/%x-%j.err
+set -euo pipefail
+cd /scratch/dexuan1/vmcnet
+module --force purge
+module load StdEnv/2023 gcc/12.3 python/3.11.5 scipy-stack/2025a
+source /home/dexuan1/projects/rrg-ortner/dexuan1/venvs/vmcnet311/bin/activate
+python experiments/N2_adcomp_E50000_compare/collect_results.py

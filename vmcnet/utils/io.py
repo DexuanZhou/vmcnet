@@ -2,6 +2,7 @@
 
 import functools
 import os
+import pickle
 from typing import Any, Callable, Dict, IO, TypeVar
 
 import jax
@@ -13,6 +14,12 @@ from .distribute import get_first
 from .typing import CheckpointData
 
 C = TypeVar("C", Dict, ConfigDict)
+
+_OPTIMIZER_TREE_FORMAT = "pytree_leaves_v1"
+_OPTIMIZER_TREE_FORMAT_KEY = "o_format"
+_OPTIMIZER_TREEDEF_KEY = "o_treedef"
+_OPTIMIZER_NUM_LEAVES_KEY = "o_num_leaves"
+_OPTIMIZER_LEAF_PREFIX = "o_leaf_"
 
 
 def open_existing_file(path, filename, option):
@@ -152,6 +159,55 @@ def unwrap_if_singleton(x):
     return x
 
 
+def _optimizer_state_to_npz_fields(optimizer_state: Any) -> Dict[str, np.ndarray]:
+    """Serialize an optimizer PyTree without making a large object array.
+
+    Numerical leaves are stored as individual ``.npy`` members in the ``.npz``
+    archive.  Only the small PyTree definition is pickled.  This avoids NumPy's
+    object-array path, which uses pickle protocol 3 and cannot serialize a bytes
+    object larger than 4 GiB.
+    """
+    leaves, tree_definition = jax.tree_util.tree_flatten(optimizer_state)
+    fields = {
+        # Keep the historical key as a small, non-object format marker.  This is
+        # useful to tools that only inspect the top-level checkpoint keys.
+        "o": np.asarray(_OPTIMIZER_TREE_FORMAT),
+        _OPTIMIZER_TREE_FORMAT_KEY: np.asarray(_OPTIMIZER_TREE_FORMAT),
+        _OPTIMIZER_TREEDEF_KEY: np.frombuffer(
+            pickle.dumps(tree_definition, protocol=4), dtype=np.uint8
+        ).copy(),
+        _OPTIMIZER_NUM_LEAVES_KEY: np.asarray(len(leaves), dtype=np.int64),
+    }
+    for index, leaf in enumerate(leaves):
+        leaf_array = np.asarray(leaf)
+        if leaf_array.dtype.hasobject:
+            raise TypeError(
+                "Optimizer PyTree leaves must be numerical arrays or scalars; "
+                f"leaf {index} has object dtype."
+            )
+        fields[f"{_OPTIMIZER_LEAF_PREFIX}{index:06d}"] = leaf_array
+    return fields
+
+
+def _load_optimizer_state(npz_data: Any) -> Any:
+    """Load either a leaf-sharded or a legacy object-array optimizer state."""
+    if _OPTIMIZER_TREE_FORMAT_KEY not in npz_data.files:
+        return unwrap_if_singleton(npz_data["o"].tolist())
+
+    optimizer_format = npz_data[_OPTIMIZER_TREE_FORMAT_KEY].item()
+    if optimizer_format != _OPTIMIZER_TREE_FORMAT:
+        raise ValueError(f"Unsupported optimizer checkpoint format: {optimizer_format}")
+
+    tree_definition = pickle.loads(npz_data[_OPTIMIZER_TREEDEF_KEY].tobytes())
+    num_leaves = int(npz_data[_OPTIMIZER_NUM_LEAVES_KEY].item())
+    leaves = [
+        npz_data[f"{_OPTIMIZER_LEAF_PREFIX}{index:06d}"]
+        for index in range(num_leaves)
+    ]
+    optimizer_state = jax.tree_util.tree_unflatten(tree_definition, leaves)
+    return unwrap_if_singleton(optimizer_state)
+
+
 def save_vmc_state(directory, name, checkpoint_data: CheckpointData):
     """Save a VMC state to disc.
 
@@ -165,6 +221,7 @@ def save_vmc_state(directory, name, checkpoint_data: CheckpointData):
       checkpoint_data (CheckpointData): data to save
     """
     (epoch, data, params, optimizer_state, key) = checkpoint_data
+    optimizer_fields = _optimizer_state_to_npz_fields(optimizer_state)
 
     with open_or_create(directory, name, "wb") as file_handle:
         np.savez(
@@ -172,8 +229,8 @@ def save_vmc_state(directory, name, checkpoint_data: CheckpointData):
             e=epoch,
             d=data,
             p=params,
-            o=optimizer_state,
             k=key,
+            **optimizer_fields,
         )
 
 
@@ -194,7 +251,7 @@ def reload_vmc_state(directory: str, name: str) -> CheckpointData:
                 data = data.tolist()  # type: ignore
 
             params = npz_data["p"].tolist()
-            optimizer_state = unwrap_if_singleton(npz_data["o"].tolist())
+            optimizer_state = _load_optimizer_state(npz_data)
             key = npz_data["k"]
             return (epoch, data, params, optimizer_state, key)
 

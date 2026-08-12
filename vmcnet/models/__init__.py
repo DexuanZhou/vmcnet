@@ -5,4 +5,5 @@ from . import construct
 from . import core
 from . import equivariance
 from . import jastrow
+from . import multilevel
 from . import weights

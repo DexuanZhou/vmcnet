@@ -361,6 +361,104 @@ def test_parse_config_with_reload_log_dir_and_override_params(mocker, tmp_path):
     _assert_configs_equal(config, expected_config)
 
 
+def test_reload_old_wssr_config_allows_new_warm_right_overrides(mocker, tmp_path):
+    """An old right-warm config accepts newly introduced optional fields."""
+    flag_values = flags.FlagValues()
+    logdir_path = os.path.join(tmp_path, "logs")
+    old_config = _write_fake_config_json(logdir_path, "config")
+    del old_config.vmc.optimizer.wssr_warm_svd_right.store_warm_u
+    del old_config.vmc.optimizer.wssr_warm_svd_right.exact_first
+    del old_config.vmc.optimizer.wssr_warm_svd_right.exact_reference_diagnostics
+    del old_config.vmc.optimizer.wssr_warm_svd_right.update_diagnostics
+    del old_config.vmc.optimizer.wssr_warm_svd_right.reliability_diagnostics
+    del old_config.vmc.optimizer.wssr_warm_svd_right.relative_singular_value_cutoff
+    del old_config.vmc.optimizer.wssr_warm_svd_right.tikhonov_lambda
+    del old_config.vmc.optimizer.wssr_warm_svd_right.error_feedback_decay
+    del old_config.vmc.optimizer.wssr_warm_svd_right.error_feedback_cap_reference
+    del old_config.vmc.optimizer.wssr_warm_svd_right.norm_constraint_mode
+    del old_config.vmc.optimizer.wssr_warm_svd_right.function_norm_constraint
+    del old_config.vmc.optimizer.wssr_warm_svd_right.euclidean_safety_constraint
+    del old_config.vmc.optimizer.spring.norm_constraint_mode
+    del old_config.vmc.optimizer.spring.function_norm_constraint
+    for key in (
+        "experimental_mode",
+        "experimental_target_rank",
+        "cluster_gap_threshold",
+        "near_tail_modes",
+        "adaptive_complement_beta",
+        "adaptive_complement_beta_function",
+        "smooth_transition_start",
+        "smooth_transition_end",
+        "force_aware_krylov_vectors",
+        "iterative_complement_iterations",
+        "native_proximal_gamma",
+    ):
+        del old_config.vmc.optimizer.wssr_warm_svd_right[key]
+    utils.io.save_config_dict_to_json(old_config, logdir_path, "config")
+    mocker.patch(
+        "sys.argv",
+        [
+            "vmcnet",
+            "--reload.logdir={}".format(logdir_path),
+            "--config.vmc.optimizer.wssr_warm_svd_right.store_warm_u=False",
+            "--config.vmc.optimizer.wssr_warm_svd_right.exact_first=True",
+            "--config.vmc.optimizer.wssr_warm_svd_right.exact_reference_diagnostics=True",
+            "--config.vmc.optimizer.wssr_warm_svd_right.reliability_diagnostics=True",
+            "--config.vmc.optimizer.wssr_warm_svd_right.experimental_mode=near_tail",
+            "--config.vmc.optimizer.wssr_warm_svd_right.near_tail_modes=128",
+            "--config.vmc.optimizer.wssr_warm_svd_right.relative_singular_value_cutoff=0.0003",
+            "--config.vmc.optimizer.wssr_warm_svd_right.tikhonov_lambda=0.001",
+            "--config.vmc.optimizer.wssr_warm_svd_right.native_proximal_gamma=0.0003",
+            "--config.vmc.optimizer.wssr_warm_svd_right.error_feedback_decay=0.95",
+            "--config.vmc.optimizer.wssr_warm_svd_right.error_feedback_cap_reference=sample_residual",
+            "--config.vmc.optimizer.wssr_warm_svd_right.norm_constraint_mode=function_space",
+            "--config.vmc.optimizer.wssr_warm_svd_right.function_norm_constraint=0.0008",
+            "--config.vmc.optimizer.wssr_warm_svd_right.euclidean_safety_constraint=0.001",
+            "--config.vmc.optimizer.wssr_warm_svd_right.adaptive_complement_beta_function=0.1",
+            "--config.vmc.optimizer.spring.norm_constraint_mode=function_space",
+            "--config.vmc.optimizer.spring.function_norm_constraint=0.0008",
+        ],
+    )
+
+    _, config = parse_flags(flag_values)
+
+    assert config.vmc.optimizer.wssr_warm_svd_right.store_warm_u is False
+    assert config.vmc.optimizer.wssr_warm_svd_right.reliability_diagnostics is True
+    assert config.vmc.optimizer.wssr_warm_svd_right.exact_first is True
+    assert config.vmc.optimizer.wssr_warm_svd_right.exact_reference_diagnostics is True
+    assert config.vmc.optimizer.wssr_warm_svd_right.experimental_mode == "near_tail"
+    assert config.vmc.optimizer.wssr_warm_svd_right.near_tail_modes == 128
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.relative_singular_value_cutoff
+        == 0.0003
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.tikhonov_lambda == 0.001
+    assert config.vmc.optimizer.wssr_warm_svd_right.native_proximal_gamma == 0.0003
+    assert config.vmc.optimizer.wssr_warm_svd_right.error_feedback_decay == 0.95
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.error_feedback_cap_reference
+        == "sample_residual"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.norm_constraint_mode
+        == "function_space"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.function_norm_constraint
+        == 0.0008
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.euclidean_safety_constraint
+        == 0.001
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.adaptive_complement_beta_function
+        == 0.1
+    )
+    assert config.vmc.optimizer.spring.norm_constraint_mode == "function_space"
+    assert config.vmc.optimizer.spring.function_norm_constraint == 0.0008
+
+
 def test_parse_config_with_use_config_file_false(mocker, tmp_path):
     """Test that parser does not try to load from file when use_config_file=False ."""
     flag_values = flags.FlagValues()

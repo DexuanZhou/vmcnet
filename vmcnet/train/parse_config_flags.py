@@ -20,6 +20,101 @@ def _get_config_from_reload(
     reloaded_config = io.load_config_dict(
         reload_config.logdir, reload_config.config_relative_file_path
     )
+    warm_right_config = reloaded_config.vmc.optimizer.get("wssr_warm_svd_right")
+    if warm_right_config is not None:
+        default_warm_right = (
+            train.default_config.get_default_config()
+            .vmc.optimizer.wssr_warm_svd_right
+        )
+        for key in (
+            "store_warm_u",
+            "semi_matrix_free_augmented",
+            "exact_first",
+            "exact_first_force",
+            "exact_reference_diagnostics",
+            "update_diagnostics",
+            "reliability_diagnostics",
+            "burst_diagnostics_payload",
+            "experimental_mode",
+            "experimental_target_rank",
+            "cluster_gap_threshold",
+            "cluster_envelope_rank",
+            "cluster_envelope_history",
+            "cluster_envelope_capacity",
+            "cluster_envelope_decay",
+            "cluster_envelope_alpha",
+            "cluster_envelope_gamma",
+            "cluster_envelope_eigenvalue_cutoff",
+            "cluster_envelope_curvature_mode",
+            "cluster_snr_gap_threshold",
+            "near_tail_modes",
+            "adaptive_complement_beta",
+            "adaptive_complement_beta_function",
+            "adaptive_complement_beta_final",
+            "adaptive_complement_decay_steps",
+            "adaptive_complement_decay_start",
+            "complement_state_decay",
+            "complement_state_relative_cap",
+            "multilevel_complement_period",
+            "multilevel_complement_cosine_threshold",
+            "smooth_transition_start",
+            "smooth_transition_end",
+            "force_aware_krylov_vectors",
+            "iterative_complement_iterations",
+            "native_proximal_gamma",
+            "euclidean_safety_constraint",
+            "relative_singular_value_cutoff",
+            "tikhonov_lambda",
+            "eta_S",
+            "eta_g",
+            "adaptive_S_average",
+            "eta_S_schedule",
+            "eta_S_max",
+            "eta_S_warmup_steps",
+            "eta_S_tau",
+            "adaptive_g_average",
+            "eta_g_schedule",
+            "eta_g_max",
+            "eta_g_warmup_steps",
+            "eta_g_tau",
+            "eta_bias_correction",
+            "enable_gradient_transport",
+            "mixed_precision_solve",
+            "solution_recurrence_mode",
+            "solution_recurrence_mu",
+            "residual_evaluation",
+            "galerkin_solve_backend",
+            "residual_dual_mode_diagnostics",
+            "solution_error_feedback",
+            "error_feedback_norm_cap",
+            "error_feedback_decay",
+            "error_feedback_cap_reference",
+            "subspace_eta_S",
+            "recurrence_telemetry",
+            "subspace_refresh_period",
+            "subspace_refresh_mode",
+            "drift_gate_monitoring",
+            "drift_gate_hypothetical_eta_g",
+            "norm_constraint_mode",
+            "function_norm_constraint",
+        ):
+            if key not in warm_right_config:
+                warm_right_config[key] = default_warm_right[key]
+    spring_config = reloaded_config.vmc.optimizer.get("spring")
+    if spring_config is not None:
+        default_spring = train.default_config.get_default_config().vmc.optimizer.spring
+        for key in (
+            "diagnostics",
+            "diagnostics_spectral",
+            "diagnostics_replay_epochs",
+            "diagnostics_replay_dir",
+            "diagnostics_decomposition",
+            "mixed_precision_solve",
+            "norm_constraint_mode",
+            "function_norm_constraint",
+        ):
+            if key not in spring_config:
+                spring_config[key] = default_spring[key]
     reloaded_config.logdir = reloaded_config.base_logdir
     config_flags.DEFINE_config_dict(
         "config", reloaded_config, lock_config=True, flag_values=flag_values

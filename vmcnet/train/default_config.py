@@ -234,6 +234,14 @@ def get_default_vmc_config() -> Dict:
         "checkpoint_variance_scale": 10,
         "disable_checkpointing": False,
         "check_for_nans": False,
+        # Rare-event snapshotting. Disabled means no device transfer, I/O, or
+        # optimizer-path change. Thresholds are meaningful only when enabled.
+        "burst_diagnostics": {
+            "enabled": False,
+            "raw_variance_threshold": float("inf"),
+            "raw_clipped_ratio_threshold": float("inf"),
+            "output_dir": "burst_diagnostics",
+        },
         "nhistory_max": 200,
         "record_amplitudes": False,
         "record_param_l1_norm": False,
@@ -281,6 +289,18 @@ def get_default_vmc_config() -> Dict:
                 "damping": 0.001,
                 "constrain_norm": True,
                 "norm_constraint": 0.001,
+                # Default preserves the paper's Euclidean update constraint.
+                # In function_space mode, the direct radius below bounds
+                # ||O_bar delta_theta||_2 on the current walker batch.
+                "norm_constraint_mode": "euclidean",
+                "function_norm_constraint": 0.001,
+                # Disabled-by-default per-step state/scale diagnostics.
+                "diagnostics": False,
+                "diagnostics_spectral": False,
+                "diagnostics_replay_epochs": (),
+                "diagnostics_replay_dir": "",
+                "diagnostics_decomposition": False,
+                "mixed_precision_solve": False,
             },
             "wssr_svd": {
                 # Learning rate settings
@@ -337,19 +357,194 @@ def get_default_vmc_config() -> Dict:
                 "learning_decay_rate": 1e-4,
                 # WSSR right-subspace warm-start SVD hyperparams
                 "damping": 0.001,
+                # Optional independent spectral controls. Negative values keep
+                # the historical coupling to ``damping`` exactly: damping is
+                # both the relative singular-value cutoff and defines
+                # lambda=(damping*sigma_max)^2. Set nonnegative values only in
+                # controlled experiments.
+                "relative_singular_value_cutoff": -1.0,
+                "tikhonov_lambda": -1.0,
                 "constrain_norm": True,
                 "norm_constraint": 0.001,
+                # Optional matrix-free function-space constraint. Disabled
+                # by default so existing WSSR configurations are unchanged.
+                "norm_constraint_mode": "euclidean",
+                "function_norm_constraint": 0.001,
                 "eta": 0.99,
+                # Independent averaging weights. Negative values inherit the
+                # legacy shared eta, preserving old configurations exactly.
+                # With adaptive_S_average enabled, an unspecified eta_g uses
+                # the current gradient (eta_g=0) instead.
+                "eta_S": -1.0,
+                "eta_g": -1.0,
+                # Default-disabled alternative to augmented-factor averaging.
+                # SSI determines U from the current batch only; history is
+                # projected into U and averages either the diagonal spectrum
+                # or near-degenerate reduced-metric blocks. The RHS remains
+                # the current gradient (eta_g must be zero when enabled).
+                "reduced_metric_history_mode": "none",
+                "spectral_history_cluster_gap": 0.01,
+                "spectral_history_noise_scale": 1.0,
+                "spectral_history_drift_scale": 1.0,
+                # Pure suggestion-1 ablation: retain legacy augmented-factor
+                # matrix/subspace averaging but replace scalar eta_S by a
+                # spectral-position weight on each stored history mode.
+                "anisotropic_matrix_history": False,
+                "anisotropic_matrix_history_noise_scale": 1.0,
+                # Optional adaptive S-history schedule. New settings take
+                # priority over eta/eta_S only when explicitly enabled.
+                "adaptive_S_average": False,
+                "eta_S_schedule": "constant",
+                "eta_S_max": 0.95,
+                "eta_S_warmup_steps": 1000,
+                "eta_S_tau": 1000.0,
+                # Optional independent schedule for gradient memory. Disabled
+                # by default; eta_g remains constant unless explicitly enabled.
+                "adaptive_g_average": False,
+                "eta_g_schedule": "constant",
+                "eta_g_max": 0.2,
+                "eta_g_warmup_steps": 1000,
+                "eta_g_tau": 1000.0,
+                # Replace the legacy gradient EMA with a first-order transported
+                # gradient memory. Disabled for exact legacy WSSR behavior.
+                "enable_gradient_transport": False,
+                # Optional startup ramp eta_t=min(eta, 1-1/t). This prevents
+                # an empty history factor from receiving the full long-memory
+                # weight in the first iterations. Disabled by default.
+                "eta_bias_correction": False,
+                # Keep the model/SVD in fp32, but add history/current rank
+                # coefficients and apply the Tikhonov filter in fp64 via a
+                # host callback. Disabled by default.
+                "mixed_precision_solve": False,
+                # Experimental full-parameter solution recurrence. ``naive``
+                # adds the current independent solve to a decayed history;
+                # ``residual`` first removes the history action visible to the
+                # current batch, matching SPRING's projection correction.
+                # Disabled by default.
+                "solution_recurrence_mode": "none",
+                "solution_recurrence_mu": 0.99,
+                # Residual evaluation for solution recurrence. The historical
+                # rank-coordinate approximation remains the default. The
+                # Galerkin-consistent option evaluates the current batch in
+                # sample space before solving inside the retained subspace.
+                "residual_evaluation": "rank_coordinate",
+                # Galerkin solve backend for full-current-batch residual
+                # recurrence. ``host_fp64`` preserves the historical NumPy
+                # callback; ``device_cholesky`` forms and solves the
+                # regularized Gram system entirely on the JAX device.
+                "galerkin_solve_backend": "host_fp64",
+                "residual_dual_mode_diagnostics": False,
+                "solution_error_feedback": False,
+                "error_feedback_norm_cap": 10.0,
+                # Error-feedback history is optionally decayed before it is
+                # projected into the next Galerkin RHS. The historical
+                # behavior is recovered with decay=1 and correction-relative
+                # clipping.
+                "error_feedback_decay": 1.0,
+                "error_feedback_cap_reference": "correction",
+                # Optional history is used only to choose the SSI subspace;
+                # current-batch residual and Galerkin solve remain unchanged.
+                "subspace_eta_S": 0.0,
+                "recurrence_telemetry": False,
+                # Refresh the SSI subspace every K updates. Intermediate
+                # updates reuse the stored left subspace but recompute current
+                # Ritz values, residuals, and Galerkin coefficients. K=1 is
+                # the exact historical behavior.
+                "subspace_refresh_period": 1,
+                # ``ritz`` preserves the original delayed-refresh experiment.
+                # ``fixed_basis`` keeps U exactly fixed between refreshes and
+                # only recomputes the current W=O.T@U and Galerkin correction.
+                # The latter is the genuinely lazy SSI fast path.
+                "subspace_refresh_mode": "ritz",
+                # Diagnostic-only hypothetical gradient-lag indicator.
+                "drift_gate_monitoring": False,
+                "drift_gate_hypothetical_eta_g": 0.8,
                 "sr_rank": 10,
                 "sr_rank_max": 100,
                 "sr_storage_rank": -1,
                 "sr_scale": 1.1,
                 "svd_maxiter_initial": 8,
                 "svd_maxiter_warm": 2,
+                # Use one exact thin-SVD initialization, then the unchanged
+                # right-warm truncated path. Disabled by default.
+                "exact_first": False,
+                "exact_first_force": False,
+                # Expensive exact-reference metrics for short validation only.
+                "exact_reference_diagnostics": False,
+                # Lightweight update/complement metrics without an exact SVD.
+                "update_diagnostics": False,
+                # Diagnostic-only reliability indicators for the approximate
+                # warm subspace and raw local-energy tails.  This recomputes a
+                # one-fewer-SSI comparison but never changes the update used
+                # by the optimizer.  Disabled by default.
+                "reliability_diagnostics": False,
+                # Emit large arrays only for host-side threshold-triggered burst
+                # snapshots. Disabled by default.
+                "burst_diagnostics_payload": False,
                 "svd_working_rank": -1,
                 "spectral_regularization": "hard_floor",
                 "complement_weight": 1.0,
                 "store_warm_u": True,
+                # Keep O_current explicit but apply the history/current
+                # augmented factor blockwise, avoiding a large concatenated
+                # O_aug allocation. Disabled for backward compatibility.
+                "semi_matrix_free_augmented": False,
+                # Independent experimental ablations. ``none`` preserves the
+                # historical warm-SVD-right update exactly.
+                "experimental_mode": "none",
+                "experimental_target_rank": -1,
+                "cluster_gap_threshold": 0.002,
+                # Default-disabled spectral-cluster envelope candidate.  It
+                # projects the current gradient onto the span of the current
+                # and recent top-k SSI bases without forming a parameter-space
+                # projector. A negative gamma uses bar_lambda + lambda.
+                "cluster_envelope_rank": 32,
+                "cluster_envelope_history": 3,
+                # A positive capacity enables the fixed-budget historical
+                # selection mode. Current directions are always retained;
+                # historical novelty competes only for the remaining slots.
+                "cluster_envelope_capacity": -1,
+                "cluster_envelope_decay": 0.8,
+                "cluster_envelope_alpha": 0.2,
+                "cluster_envelope_gamma": -1.0,
+                "cluster_envelope_eigenvalue_cutoff": 1e-6,
+                # ``scalar`` preserves the first prototype. ``rayleigh_ritz``
+                # solves the current-batch projected Fisher equation on the
+                # complete enclosing subspace instead of replacing its
+                # anisotropic curvature by one mean eigenvalue.
+                "cluster_envelope_curvature_mode": "scalar",
+                # Default-disabled cross-half-batch empirical shrinkage for
+                # the current-batch Ritz solve. Near-degenerate Ritz modes
+                # share one SNR weight, avoiding basis-dependent filtering.
+                "cluster_snr_gap_threshold": 0.05,
+                "near_tail_modes": 0,
+                "adaptive_complement_beta": 0.0,
+                # Optional current-batch Fisher-metric cap on the same
+                # complement. Zero preserves the legacy Euclidean-only cap.
+                "adaptive_complement_beta_function": 0.0,
+                # Optional continuation-local linear beta decay. A nonpositive
+                # number of steps disables it exactly.
+                "adaptive_complement_beta_final": 0.0,
+                "adaptive_complement_decay_steps": 0,
+                "adaptive_complement_decay_start": 0,
+                # Experimental EMA of the already beta-capped complement.
+                # A nonpositive decay disables the state exactly.
+                "complement_state_decay": 0.0,
+                "complement_state_relative_cap": 0.0,
+                "multilevel_complement_period": 1,
+                "multilevel_complement_cosine_threshold": 0.0,
+                "smooth_transition_start": -1,
+                "smooth_transition_end": -1,
+                "force_aware_krylov_vectors": 0,
+                "iterative_complement_iterations": 0,
+                # Default-disabled temporal proximal regularization inside the
+                # production warm2 SSI factors.  A positive value is gamma in
+                # c_i=((s_i^2+lambda)c_i^native+gamma<u_i,d_prev>)/
+                #     (s_i^2+lambda+gamma).
+                "native_proximal_gamma": 0.0,
+                # Optional Euclidean backstop applied after the selected
+                # global norm constraint. A negative value disables it.
+                "euclidean_safety_constraint": -1.0,
             },
             "wssr_warm_svd_right_matfree": {
                 # Learning rate settings
@@ -358,6 +553,8 @@ def get_default_vmc_config() -> Dict:
                 "learning_decay_rate": 1e-4,
                 # Experimental matrix-free right-subspace warm-start SVD hyperparams
                 "damping": 0.001,
+                "relative_singular_value_cutoff": -1.0,
+                "tikhonov_lambda": -1.0,
                 "constrain_norm": True,
                 "norm_constraint": 0.001,
                 "eta": 0.99,

@@ -89,6 +89,9 @@ def combine_local_energy_terms(
             local_energy_sum = cast(Array, local_energy_sum + term(params, x))
         return local_energy_sum
 
+    # Diagnostic consumers may evaluate the same terms separately without changing
+    # the normal summed local-energy path.
+    local_energy_fn._vmcnet_local_energy_terms = tuple(local_energy_terms)
     return local_energy_fn
 
 
@@ -187,6 +190,12 @@ def create_value_and_grad_energy_fn(
             used instead of jnp.mean and jnp.sum for the terms in the gradient
             calculation. Can be set to False when debugging if trying to find the source
             of unexpected nans. Defaults to True.
+        record_diagnostic_payload (bool, optional): record raw local energies and,
+            when available, separately evaluated Hamiltonian components. Defaults to
+            False.
+        record_raw_local_energies (bool, optional): expose the already computed raw
+            local-energy array in the returned statistics without changing how the
+            Hamiltonian is evaluated. Defaults to False.
 
     Returns:
         Callable: function which computes the clipped energy value and gradient. Has the
@@ -244,6 +253,8 @@ def create_energy_and_statistics_fn(
     nchains: int,
     clipping_fn: Optional[ClippingFn] = None,
     nan_safe: bool = True,
+    record_diagnostic_payload: bool = False,
+    record_raw_local_energies: bool = False,
 ) -> ValueGradEnergyFn[P]:
     """Create a function which computes energies and associated statistics.
 
@@ -273,13 +284,31 @@ def create_energy_and_statistics_fn(
     """
 
     def energy_and_statistics(params, positions):
-        local_energies_noclip = jax.vmap(
-            local_energy_fn, in_axes=(None, 0), out_axes=0
-        )(params, positions)
+        if record_diagnostic_payload and hasattr(
+            local_energy_fn, "_vmcnet_local_energy_terms"
+        ):
+            components = jnp.stack(
+                [
+                    jax.vmap(term, in_axes=(None, 0), out_axes=0)(params, positions)
+                    for term in local_energy_fn._vmcnet_local_energy_terms
+                ],
+                axis=0,
+            )
+            local_energies_noclip = jnp.sum(components, axis=0)
+        else:
+            local_energies_noclip = jax.vmap(
+                local_energy_fn, in_axes=(None, 0), out_axes=0
+            )(params, positions)
+            components = None
 
         energy, local_energies, stats = get_clipped_energies_and_stats(
             local_energies_noclip, nchains, clipping_fn, nan_safe
         )
+        if record_diagnostic_payload or record_raw_local_energies:
+            stats["local_energies_noclip"] = local_energies_noclip
+        if record_diagnostic_payload:
+            if components is not None:
+                stats["hamiltonian_components"] = components
 
         return energy, local_energies, stats
 

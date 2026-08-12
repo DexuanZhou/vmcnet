@@ -11,6 +11,7 @@ from typing import Any, Optional, Tuple, Union
 import chex
 import flax
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 from absl import flags
@@ -517,6 +518,9 @@ def _burn_and_run_vmc(
         nhistory_max=nhistory_max,
         is_pmapped=is_pmapped,
         start_epoch=start_epoch,
+        burst_diagnostics_config=run_config.get(
+            "burst_diagnostics", {"enabled": False}
+        ),
     )
 
 
@@ -623,7 +627,50 @@ def run_molecule() -> None:
             )
 
         if not reload_config.new_optimizer_state:
-            optimizer_state = reloaded_optimizer_state
+            # Split gradient averaging (and optional transport) adds two
+            # full-parameter memories. When enabled on a legacy WSSR checkpoint,
+            # retain the low-rank/Optax history and initialize the new memory at
+            # the reloaded parameters.
+            if (
+                hasattr(optimizer_state, "transported_gradient")
+                and not hasattr(reloaded_optimizer_state, "transported_gradient")
+            ):
+                flat_reloaded_params, _ = jax.flatten_util.ravel_pytree(params)
+                optimizer_state = optimizer_state._replace(
+                    core_state=reloaded_optimizer_state.core_state,
+                    optax_state=reloaded_optimizer_state.optax_state,
+                    transported_gradient=jnp.zeros_like(flat_reloaded_params),
+                    previous_theta=flat_reloaded_params,
+                    transport_initialized=jnp.asarray(False),
+                )
+            elif (
+                not hasattr(optimizer_state, "transported_gradient")
+                and hasattr(reloaded_optimizer_state, "transported_gradient")
+            ):
+                optimizer_state = type(optimizer_state)(
+                    core_state=reloaded_optimizer_state.core_state,
+                    optax_state=reloaded_optimizer_state.optax_state,
+                )
+            # Experimental adaptive-complement EMA adds one zero-initialized field
+            # while retaining the checkpoint's WSSR history and Optax counter.
+            elif (
+                hasattr(optimizer_state, "complement_ema")
+                and not hasattr(reloaded_optimizer_state, "complement_ema")
+            ):
+                optimizer_state = optimizer_state._replace(
+                    core_state=reloaded_optimizer_state.core_state,
+                    optax_state=reloaded_optimizer_state.optax_state,
+                )
+            elif (
+                not hasattr(optimizer_state, "complement_ema")
+                and hasattr(reloaded_optimizer_state, "complement_ema")
+            ):
+                optimizer_state = type(optimizer_state)(
+                    core_state=reloaded_optimizer_state.core_state,
+                    optax_state=reloaded_optimizer_state.optax_state,
+                )
+            else:
+                optimizer_state = reloaded_optimizer_state
             start_epoch = reload_at_epoch
 
     logging.info("Saving to %s", logdir)

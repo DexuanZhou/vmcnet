@@ -159,6 +159,489 @@ def _legacy_dynamic_augment_wssr_system(o_cur, e_cur, state, eta):
     )
 
 
+@pytest.mark.parametrize("eta_g", [0.5, 0.8, 0.95])
+def test_transported_gradient_removes_fixed_quadratic_ema_bias(eta_g):
+    hessian = jnp.array(
+        [[4.0, 0.5, 0.0], [0.5, 2.0, 0.25], [0.0, 0.25, 1.0]],
+        dtype=jnp.float32,
+    )
+    theta_previous = jnp.array([0.8, -0.3, 0.5], dtype=jnp.float32)
+    theta_current = jnp.array([0.35, 0.1, -0.2], dtype=jnp.float32)
+    gradient_previous = hessian @ theta_previous
+    gradient_current = hessian @ theta_current
+    operator_delta = hessian @ (theta_current - theta_previous)
+
+    ordinary_ema = (
+        eta_g * gradient_previous + (1.0 - eta_g) * gradient_current
+    )
+    transported = wssr.transport_gradient_memory(
+        gradient_previous,
+        gradient_current,
+        operator_delta,
+        eta_g,
+        jnp.asarray(True),
+    )
+    gradient_error = jnp.linalg.norm(ordinary_ema - gradient_current)
+    transported_gradient_error = jnp.linalg.norm(transported - gradient_current)
+    print(
+        f"eta_g={eta_g}: gradient error={float(gradient_error):.8e}, "
+        "transported gradient error="
+        f"{float(transported_gradient_error):.8e}"
+    )
+
+    assert gradient_error > 1e-2
+    np.testing.assert_allclose(
+        transported, gradient_current, rtol=1e-6, atol=1e-6
+    )
+
+
+def _split_eta_test_system():
+    state = wssr.initialize_wssr_core_state(
+        num_params=3, sr_rank=2, sr_rank_max=2, dtype=jnp.float32
+    )._replace(
+        sr_o=jnp.array(
+            [[1.0, 0.25], [0.5, -1.0], [-0.5, 0.75]], dtype=jnp.float32
+        ),
+        ek=jnp.array([0.4, -0.2], dtype=jnp.float32),
+        sr_rank0=jnp.asarray(2),
+    )
+    o_current = jnp.array(
+        [[0.5, -0.25], [1.0, 0.5], [-0.75, 0.25]], dtype=jnp.float32
+    )
+    e_current = jnp.array([0.3, -0.6], dtype=jnp.float32)
+    previous_gradient = state.sr_o @ state.ek
+    current_gradient = o_current @ e_current
+    return state, o_current, e_current, previous_gradient, current_gradient
+
+
+def test_split_eta_S_history_with_current_batch_gradient():
+    """eta_S=.95, eta_g=0 keeps S history but uses the current gradient."""
+    state, o_current, e_current, previous_gradient, current_gradient = (
+        _split_eta_test_system()
+    )
+    o_aug, _ = wssr.augment_wssr_system(
+        o_current, e_current, state, eta=0.95
+    )
+    gradient_history = wssr.transport_gradient_memory(
+        previous_gradient,
+        current_gradient,
+        jnp.zeros_like(current_gradient),
+        eta_g=0.0,
+        transport_initialized=jnp.asarray(True),
+    )
+
+    np.testing.assert_allclose(o_aug[:, :2], jnp.sqrt(0.95) * state.sr_o)
+    np.testing.assert_allclose(
+        o_aug[:, 2:], jnp.sqrt(0.05) * o_current, rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(gradient_history, current_gradient)
+
+
+def test_split_eta_g_history_without_S_averaging():
+    """eta_S=0, eta_g=.95 removes S history but retains gradient history."""
+    state, o_current, e_current, previous_gradient, current_gradient = (
+        _split_eta_test_system()
+    )
+    o_aug, _ = wssr.augment_wssr_system(
+        o_current, e_current, state, eta=0.0
+    )
+    gradient_history = wssr.transport_gradient_memory(
+        previous_gradient,
+        current_gradient,
+        jnp.zeros_like(current_gradient),
+        eta_g=0.95,
+        transport_initialized=jnp.asarray(True),
+    )
+
+    np.testing.assert_allclose(o_aug[:, :2], jnp.zeros_like(state.sr_o))
+    np.testing.assert_allclose(o_aug[:, 2:], o_current)
+    np.testing.assert_allclose(
+        gradient_history,
+        0.95 * previous_gradient + 0.05 * current_gradient,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_equal_split_etas_match_legacy_augmented_force():
+    """eta_S=eta_g follows the exact legacy shared-eta RHS."""
+    state, o_current, e_current, previous_gradient, current_gradient = (
+        _split_eta_test_system()
+    )
+    o_aug, e_aug = wssr.augment_wssr_system(
+        o_current, e_current, state, eta=0.95
+    )
+    split_gradient_history = wssr.transport_gradient_memory(
+        previous_gradient,
+        current_gradient,
+        jnp.zeros_like(current_gradient),
+        eta_g=0.95,
+        transport_initialized=jnp.asarray(True),
+    )
+
+    np.testing.assert_allclose(
+        split_gradient_history, o_aug @ e_aug, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_split_eta_resolution_prefers_new_keys_and_falls_back_to_eta():
+    config = default_config.get_default_config().vmc.optimizer.wssr_warm_svd_right
+    config.eta = 0.8
+    assert wssr.resolve_wssr_averaging_weights(config) == (0.8, 0.8)
+
+    config.eta_S = 0.95
+    config.eta_g = 0.0
+    assert wssr.resolve_wssr_averaging_weights(config) == (0.95, 0.0)
+
+
+def test_adaptive_eta_resolution_defaults_to_current_gradient():
+    config = default_config.get_default_config().vmc.optimizer.wssr_warm_svd_right
+    config.eta = 0.8
+    config.eta_S = -1.0
+    config.eta_g = -1.0
+    config.adaptive_S_average = True
+    config.eta_S_max = 0.95
+
+    assert wssr.resolve_wssr_averaging_weights(config) == (0.95, 0.0)
+
+
+def test_adaptive_gradient_eta_resolution_uses_independent_maximum():
+    config = default_config.get_default_config().vmc.optimizer.wssr_warm_svd_right
+    config.eta = 0.8
+    config.eta_S = -1.0
+    config.eta_g = -1.0
+    config.adaptive_S_average = True
+    config.eta_S_max = 0.95
+    config.adaptive_g_average = True
+    config.eta_g_max = 0.2
+
+    assert wssr.resolve_wssr_averaging_weights(config) == (0.95, 0.2)
+
+
+def test_adaptive_s_averaging_eta_schedules():
+    steps = jnp.array([0, 2, 5, 10], dtype=jnp.int32)
+    constant = jax.vmap(
+        lambda step: wssr.adaptive_s_averaging_eta(
+            "constant", 0.95, step, 10, 5.0
+        )
+    )(steps)
+    linear = jax.vmap(
+        lambda step: wssr.adaptive_s_averaging_eta(
+            "linear_warmup", 0.95, step, 10, 5.0
+        )
+    )(steps)
+    exponential = jax.vmap(
+        lambda step: wssr.adaptive_s_averaging_eta(
+            "exponential_growth", 0.95, step, 10, 5.0
+        )
+    )(steps)
+
+    np.testing.assert_allclose(constant, 0.95 * np.ones(4), rtol=1e-6)
+    np.testing.assert_allclose(
+        linear, 0.95 * np.array([0.0, 0.2, 0.5, 1.0]), rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        exponential,
+        0.95 * (1.0 - np.exp(-np.array([0.0, 2.0, 5.0, 10.0]) / 5.0)),
+        rtol=1e-6,
+    )
+
+
+def test_adaptive_s_average_integrated_metrics_use_actual_parameter_delta():
+    params = _tiny_params()
+    initial_params = jax.tree_util.tree_map(lambda value: value.copy(), params)
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.01
+    opt.constrain_norm = False
+    opt.adaptive_S_average = True
+    opt.eta_S_schedule = "linear_warmup"
+    opt.eta_S_max = 0.8
+    opt.eta_S_warmup_steps = 4
+    opt.eta_g = -1.0
+    opt.enable_gradient_transport = False
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.0
+    opt.tikhonov_lambda = 0.1
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(92),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRTransportedGradientOptimizerState)
+
+    params, data, state, metrics_1, key = update_param_fn(
+        params, data, state, key
+    )
+    params_after_first = params
+    params, _, state, metrics_2, _ = update_param_fn(
+        params, data, state, key
+    )
+    actual_first_update = jax.tree_util.tree_map(
+        lambda current, initial: current - initial,
+        params_after_first,
+        initial_params,
+    )
+
+    assert metrics_1["adaptive_S_step"] == 0
+    assert metrics_1["eta_S_current"] == pytest.approx(0.0)
+    assert metrics_1["eta_g"] == pytest.approx(0.0)
+    assert metrics_2["adaptive_S_step"] == 1
+    assert metrics_2["eta_S_current"] == pytest.approx(0.2)
+    assert metrics_2["delta_theta_norm"] == pytest.approx(
+        float(wssr.tree_l2_norm(actual_first_update)), rel=1e-5
+    )
+    assert jnp.isfinite(metrics_2["S_current_minus_ema_action_norm"])
+    assert jnp.isfinite(metrics_2["S_transport_norm"])
+
+
+def test_adaptive_gradient_average_integrated_schedule():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.01
+    opt.constrain_norm = False
+    opt.eta_S = 0.0
+    opt.adaptive_g_average = True
+    opt.eta_g_schedule = "exponential_growth"
+    opt.eta_g_max = 0.2
+    opt.eta_g_tau = 4.0
+    opt.enable_gradient_transport = True
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.0
+    opt.tikhonov_lambda = 0.1
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(192),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRTransportedGradientOptimizerState)
+    params, data, state, metrics_1, key = update_param_fn(
+        params, data, state, key
+    )
+    params, _, _, metrics_2, _ = update_param_fn(params, data, state, key)
+
+    assert metrics_1["eta_g_current"] == pytest.approx(0.0)
+    assert metrics_2["eta_g_current"] == pytest.approx(
+        0.2 * (1.0 - np.exp(-0.25)), rel=1e-6
+    )
+
+
+@pytest.mark.parametrize("eta_S,eta_g", [(0.95, 0.0), (0.0, 0.95)])
+def test_split_eta_optimizer_interface_smoke(eta_S, eta_g):
+    """Independent weights run through the integrated optimizer state path."""
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.01
+    opt.constrain_norm = False
+    opt.eta_S = eta_S
+    opt.eta_g = eta_g
+    opt.enable_gradient_transport = False
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.0
+    opt.tikhonov_lambda = 0.1
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(91),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRTransportedGradientOptimizerState)
+
+    params, data, state, metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    params, _, state, metrics, _ = update_param_fn(
+        params, data, state, key
+    )
+    _assert_tree_all_finite(params)
+    assert metrics["eta_S"] == pytest.approx(eta_S)
+    assert metrics["eta_g"] == pytest.approx(eta_g)
+    assert jnp.isfinite(metrics["gradient_norm"])
+    assert jnp.isfinite(metrics["gradient_history_norm"])
+    assert "S_transport_norm" not in metrics
+
+
+def test_equal_explicit_split_etas_resolve_to_legacy_pair():
+    def make_config(explicit_split):
+        config = default_config.get_default_config()
+        config.vmc.nchains = _tiny_positions().shape[0]
+        config.vmc.optimizer_type = "wssr_warm_svd_right"
+        opt = config.vmc.optimizer.wssr_warm_svd_right
+        opt.schedule_type = "constant"
+        opt.learning_rate = 0.01
+        opt.constrain_norm = False
+        opt.eta = 0.95
+        if explicit_split:
+            opt.eta_S = 0.95
+            opt.eta_g = 0.95
+        opt.enable_gradient_transport = False
+        opt.sr_rank = 2
+        opt.sr_rank_max = 3
+        opt.sr_storage_rank = 3
+        opt.svd_working_rank = 3
+        opt.svd_maxiter_initial = 2
+        opt.svd_maxiter_warm = 1
+        opt.spectral_regularization = "tikhonov"
+        opt.complement_weight = 0.0
+        opt.relative_singular_value_cutoff = 0.0
+        opt.tikhonov_lambda = 0.1
+        return config
+
+    params = _tiny_params()
+    data = _tiny_positions()
+    initialized = []
+    for explicit_split in (False, True):
+        config = make_config(explicit_split)
+        update_fn, state, key = initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(101),
+            apply_pmap=False,
+        )
+        assert type(state) is wssr.WSSROptimizerState
+        initialized.append((update_fn, state, key))
+
+    outputs = [
+        update_fn(params, data, state, key)
+        for update_fn, state, key in initialized
+    ]
+    assert_pytree_allclose(outputs[0][0], outputs[1][0])
+    assert_pytree_allclose(outputs[0][2], outputs[1][2])
+    assert outputs[0][3]["eta_S"] == pytest.approx(0.95)
+    assert outputs[0][3]["eta_g"] == pytest.approx(0.95)
+    assert outputs[1][3]["eta_S"] == pytest.approx(0.95)
+    assert outputs[1][3]["eta_g"] == pytest.approx(0.95)
+
+
+def test_apply_wssr_history_operator_matches_low_rank_product():
+    state = wssr.initialize_wssr_core_state(
+        num_params=4, sr_rank=2, sr_rank_max=3, dtype=jnp.float32
+    )._replace(
+        sr_o=jnp.array(
+            [
+                [1.0, 0.5, 9.0],
+                [0.0, -1.0, 9.0],
+                [2.0, 0.25, 9.0],
+                [-0.5, 0.75, 9.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        sr_rank0=jnp.asarray(2),
+    )
+    vector = jnp.array([0.25, -0.5, 1.25, 0.75], dtype=jnp.float32)
+    active_factor = state.sr_o[:, :2]
+    expected = active_factor @ (active_factor.T @ vector)
+
+    np.testing.assert_allclose(
+        wssr.apply_wssr_history_operator(state, vector),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("mixed_precision_solve", [False, True])
+def test_wssr_force_override_replaces_legacy_gradient_history(
+    mixed_precision_solve,
+):
+    state, o_aug, e_aug, u, singular_values, vh = (
+        _spectral_regularization_fixture()
+    )
+    force_override = jnp.array([0.75, -0.5, 1.25], dtype=jnp.float32)
+    result = wssr._wssr_update_from_svd(
+        o_aug=o_aug,
+        e_aug=e_aug,
+        state=state,
+        u=u,
+        singular_values=singular_values,
+        vh=vh,
+        damping=0.1,
+        norm_constraint=10.0,
+        sr_rank_max=3,
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.5,
+        mixed_precision_solve=mixed_precision_solve,
+        mixed_precision_history_width=2,
+        force_override=force_override,
+    )
+    expected = u @ (
+        (u.T @ force_override) / (jnp.square(singular_values) + 0.5)
+    )
+
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=2e-6, atol=2e-6
+    )
+    np.testing.assert_array_equal(result.state.ek, jnp.zeros_like(result.state.ek))
+
+
 def test_initialize_wssr_core_state_shapes_and_ranks():
     state = wssr.initialize_wssr_core_state(
         num_params=5, sr_rank=3, sr_rank_max=7, dtype=jnp.float32
@@ -220,14 +703,119 @@ def test_default_config_contains_wssr_warm_svd_right():
     assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank == 10
     assert config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max == 100
     assert config.vmc.optimizer.wssr_warm_svd_right.sr_storage_rank == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_S == -1.0
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_g == -1.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.reduced_metric_history_mode
+        == "none"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.spectral_history_cluster_gap
+        == 0.01
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.spectral_history_noise_scale
+        == 1.0
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.spectral_history_drift_scale
+        == 1.0
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.anisotropic_matrix_history
+        is False
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right
+        .anisotropic_matrix_history_noise_scale
+        == 1.0
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.adaptive_S_average is False
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_S_schedule == "constant"
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_S_max == 0.95
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_S_warmup_steps == 1000
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_S_tau == 1000.0
+    assert config.vmc.optimizer.wssr_warm_svd_right.adaptive_g_average is False
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_g_schedule == "constant"
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_g_max == 0.2
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_g_warmup_steps == 1000
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_g_tau == 1000.0
+    assert config.vmc.optimizer.wssr_warm_svd_right.eta_bias_correction is False
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.enable_gradient_transport
+        is False
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.mixed_precision_solve is False
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.solution_recurrence_mode
+        == "none"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.solution_recurrence_mu
+        == 0.99
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.residual_evaluation
+        == "rank_coordinate"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.galerkin_solve_backend
+        == "host_fp64"
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.residual_dual_mode_diagnostics
+        is False
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.solution_error_feedback
+        is False
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.error_feedback_decay == 1.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.error_feedback_cap_reference
+        == "correction"
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.subspace_eta_S == 0.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.subspace_refresh_mode
+        == "ritz"
+    )
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_initial == 8
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_maxiter_warm == 2
+    assert config.vmc.optimizer.wssr_warm_svd_right.exact_first is False
     assert config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank == -1
     assert config.vmc.optimizer.wssr_warm_svd_right.spectral_regularization == (
         "hard_floor"
     )
     assert config.vmc.optimizer.wssr_warm_svd_right.complement_weight == 1.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.relative_singular_value_cutoff
+        == -1.0
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.tikhonov_lambda == -1.0
     assert config.vmc.optimizer.wssr_warm_svd_right.store_warm_u is True
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.semi_matrix_free_augmented
+        is False
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.reliability_diagnostics is False
+    assert config.vmc.optimizer.wssr_warm_svd_right.experimental_mode == "none"
+    assert config.vmc.optimizer.wssr_warm_svd_right.experimental_target_rank == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right.cluster_gap_threshold == 0.002
+    assert config.vmc.optimizer.wssr_warm_svd_right.near_tail_modes == 0
+    assert config.vmc.optimizer.wssr_warm_svd_right.adaptive_complement_beta == 0.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.adaptive_complement_beta_function
+        == 0.0
+    )
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right.euclidean_safety_constraint
+        == -1.0
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right.smooth_transition_start == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right.smooth_transition_end == -1
+    assert config.vmc.optimizer.wssr_warm_svd_right.force_aware_krylov_vectors == 0
+    assert config.vmc.optimizer.wssr_warm_svd_right.iterative_complement_iterations == 0
 
 
 def test_default_config_contains_wssr_warm_svd_right_matfree():
@@ -244,6 +832,11 @@ def test_default_config_contains_wssr_warm_svd_right_matfree():
         "hard_floor"
     )
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.complement_weight == 1.0
+    assert (
+        config.vmc.optimizer.wssr_warm_svd_right_matfree.relative_singular_value_cutoff
+        == -1.0
+    )
+    assert config.vmc.optimizer.wssr_warm_svd_right_matfree.tikhonov_lambda == -1.0
     assert config.vmc.optimizer.wssr_warm_svd_right_matfree.store_warm_u is True
 
 
@@ -780,6 +1373,717 @@ def test_wssr_update_tikhonov_complement_weight_matches_formula(
     np.testing.assert_allclose(
         result.grad_like_update, expected, rtol=1e-5, atol=1e-5
     )
+
+
+def test_wssr_fixed_tikhonov_lambda_is_independent_of_cutoff():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    fixed_lambda = 0.5
+    result = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping=0.1,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.1,
+        tikhonov_lambda=fixed_lambda,
+    )
+
+    force = o_aug @ e_aug
+    expected = u @ ((u.T @ force) / (jnp.square(singular_values) + fixed_lambda))
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=1e-5, atol=1e-5
+    )
+    assert int(result.active_rank) == 3
+
+
+def test_wssr_mixed_precision_rank_solve_matches_fixed_tikhonov_update():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    common = dict(
+        o_aug=o_aug,
+        e_aug=e_aug,
+        state=state,
+        u=u,
+        singular_values=singular_values,
+        vh=vh,
+        damping=0.1,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.1,
+        tikhonov_lambda=0.5,
+    )
+    reference = wssr._wssr_update_from_svd(**common)
+    mixed = wssr._wssr_update_from_svd(
+        mixed_precision_solve=True,
+        mixed_precision_history_width=2,
+        **common,
+    )
+
+    assert mixed.grad_like_update.dtype == jnp.float32
+    chex.assert_trees_all_close(
+        mixed.grad_like_update,
+        reference.grad_like_update,
+        rtol=2e-6,
+        atol=2e-6,
+    )
+    chex.assert_trees_all_equal(mixed.state, reference.state)
+
+
+@pytest.mark.parametrize("mode", ["naive", "residual"])
+def test_wssr_solution_recurrence_matches_rank_space_formula(mode):
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    prior = jnp.array([0.2, -0.3, 0.7], dtype=jnp.float32)
+    fixed_lambda = 0.5
+    history_width = 2
+    result = wssr._wssr_update_from_svd(
+        o_aug=o_aug,
+        e_aug=e_aug,
+        state=state,
+        u=u,
+        singular_values=singular_values,
+        vh=vh,
+        damping=0.1,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.3,
+        tikhonov_lambda=fixed_lambda,
+        mixed_precision_solve=True,
+        mixed_precision_history_width=history_width,
+        solution_prior=prior,
+        solution_recurrence_mode=mode,
+    )
+
+    current_force = o_aug[:, history_width:] @ e_aug[history_width:]
+    retained = singular_values / singular_values[0] > 0.3
+    numerator = u.T @ current_force
+    if mode == "residual":
+        numerator = numerator - jnp.square(singular_values) * (u.T @ prior)
+    correction = jnp.where(
+        retained,
+        numerator / (jnp.square(singular_values) + fixed_lambda),
+        0.0,
+    )
+    expected = prior + u @ correction
+    chex.assert_trees_all_close(
+        result.grad_like_update, expected, rtol=2e-6, atol=2e-6
+    )
+    # The third mode is truncated, so its prior component must survive exactly.
+    assert result.grad_like_update[2] == pytest.approx(prior[2])
+
+
+def test_full_current_batch_galerkin_matches_full_rank_recurrence():
+    """The full-current residual is the code-coordinate SPRING projection.
+
+    VMCNet stores ``o_cur = O_bar.T`` (parameters by samples), so a basis
+    spanning ``range(o_cur)`` must reproduce the existing full-rank recurrence.
+    This is the small analogue of the r=1600, eta_S=0 C regression anchor.
+    """
+    o_cur = jnp.array(
+        [
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, -1.0],
+            [2.0, 1.0, 0.0],
+            [-1.0, 2.0, 1.0],
+            [0.5, -0.25, 0.75],
+        ],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.4, -0.7, 0.3], dtype=jnp.float32)
+    prior = jnp.array([0.2, -0.1, 0.3, 0.4, -0.2], dtype=jnp.float32)
+    u, singular_values, vh = jnp.linalg.svd(o_cur, full_matrices=False)
+    state = wssr.initialize_wssr_core_state(
+        o_cur.shape[0], sr_rank=3, sr_rank_max=3
+    )
+    rank_coordinate = wssr._wssr_update_from_svd(
+        o_aug=o_cur,
+        e_aug=e_cur,
+        state=state,
+        u=u,
+        singular_values=singular_values,
+        vh=vh,
+        damping=0.0,
+        norm_constraint=10.0,
+        sr_rank_max=3,
+        sr_scale=1.0,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=1e-3,
+        mixed_precision_solve=True,
+        mixed_precision_history_width=0,
+        solution_prior=prior,
+        solution_recurrence_mode="residual",
+    )
+    full_current = wssr.galerkin_residual_solution_recurrence(
+        o_cur,
+        e_cur,
+        u,
+        prior,
+        lambda_reg=1e-3,
+    )
+
+    chex.assert_trees_all_close(
+        full_current.direction,
+        rank_coordinate.grad_like_update,
+        rtol=5e-5,
+        atol=5e-5,
+    )
+
+
+def test_cached_current_action_matches_explicit_fp64():
+    """An exact SVD factor recovers O.T @ U without approximation."""
+    with jax.experimental.enable_x64():
+        history = jnp.array(
+            [[0.3, -0.2], [0.5, 0.1], [-0.7, 0.4], [0.2, 0.8]],
+            dtype=jnp.float64,
+        )
+        o_cur = jnp.array(
+            [[0.6, -0.1, 0.4], [0.2, 0.9, -0.5],
+             [-0.3, 0.7, 0.8], [0.1, -0.4, 0.5]],
+            dtype=jnp.float64,
+        )
+        current_scale = jnp.asarray(0.7, dtype=jnp.float64)
+        o_aug = jnp.concatenate([history, current_scale * o_cur], axis=1)
+        u, singular_values, vh = jnp.linalg.svd(o_aug, full_matrices=False)
+        cached = wssr.cached_current_action_from_svd(
+            vh,
+            singular_values,
+            active_rank=jnp.asarray(singular_values.shape[0]),
+            storage_width=singular_values.shape[0],
+            current_sample_width=o_cur.shape[1],
+            current_block_scale=current_scale,
+        )
+        explicit = o_cur.T @ u
+
+        np.testing.assert_allclose(cached, explicit, rtol=1e-11, atol=1e-11)
+
+
+def test_right_ssi_returned_current_action_matches_explicit_fp64():
+    """A refresh step must not substitute approximate right-SSI V*s."""
+    with jax.experimental.enable_x64():
+        o_aug = jnp.array(
+            [
+                [0.4, -0.2, 0.7, 0.1, -0.5],
+                [0.8, 0.3, -0.4, 0.6, 0.2],
+                [-0.1, 0.9, 0.5, -0.7, 0.4],
+                [0.6, -0.8, 0.2, 0.3, 0.9],
+                [-0.5, 0.1, 0.8, -0.2, 0.7],
+                [0.2, 0.5, -0.6, 0.9, -0.3],
+            ],
+            dtype=jnp.float64,
+        )
+        warm_u, _ = jnp.linalg.qr(
+            jnp.array(
+                [
+                    [1.0, 0.2],
+                    [0.1, 1.0],
+                    [0.5, -0.3],
+                    [-0.2, 0.4],
+                    [0.3, 0.6],
+                    [-0.4, 0.1],
+                ],
+                dtype=jnp.float64,
+            ),
+            mode="reduced",
+        )
+        state = wssr.initialize_wssr_warm_svd_core_state(
+            num_params=o_aug.shape[0],
+            sr_rank=2,
+            sr_rank_max=2,
+            dtype=jnp.float64,
+            store_warm_u=True,
+        )._replace(u=warm_u, has_u=jnp.asarray(True))
+        result, current_action = wssr.wssr_warm_svd_right_core_update(
+            o_aug,
+            jnp.array([0.3, -0.2, 0.4, 0.1, -0.5], dtype=jnp.float64),
+            state,
+            jax.random.PRNGKey(23),
+            damping=0.0,
+            norm_constraint=10.0,
+            sr_rank_max=2,
+            sr_scale=1.0,
+            svd_maxiter_initial=2,
+            svd_maxiter_warm=1,
+            svd_working_rank=2,
+            constrain_update_norm=False,
+            spectral_regularization="tikhonov",
+            complement_weight=0.0,
+            relative_singular_value_cutoff=0.0,
+            tikhonov_lambda=1e-3,
+            return_current_action=True,
+            current_sample_width=3,
+            reuse_warm_subspace=jnp.asarray(False),
+        )
+        explicit = o_aug[:, -3:].T @ result.state.u
+
+        np.testing.assert_allclose(
+            current_action, explicit, rtol=1e-11, atol=1e-11
+        )
+
+
+def test_cached_and_explicit_galerkin_corrections_match_fp64():
+    with jax.experimental.enable_x64():
+        o_cur = jnp.array(
+            [[1.0, 0.0, 2.0], [0.0, 1.0, -1.0],
+             [2.0, 1.0, 0.0], [-1.0, 2.0, 1.0]],
+            dtype=jnp.float64,
+        )
+        e_cur = jnp.array([0.4, -0.7, 0.3], dtype=jnp.float64)
+        prior = jnp.array([0.2, -0.1, 0.3, 0.4], dtype=jnp.float64)
+        basis, singular_values, vh = jnp.linalg.svd(
+            o_cur, full_matrices=False
+        )
+        cached_action = wssr.cached_current_action_from_svd(
+            vh,
+            singular_values,
+            active_rank=jnp.asarray(singular_values.shape[0]),
+            storage_width=singular_values.shape[0],
+            current_sample_width=o_cur.shape[1],
+        )
+        explicit = wssr.galerkin_residual_solution_recurrence(
+            o_cur, e_cur, basis, prior, lambda_reg=1e-3
+        )
+        cached = wssr.galerkin_residual_solution_recurrence(
+            o_cur,
+            e_cur,
+            basis,
+            prior,
+            lambda_reg=1e-3,
+            current_action=cached_action,
+        )
+
+        np.testing.assert_allclose(
+            cached.correction, explicit.correction, rtol=1e-11, atol=1e-11
+        )
+        assert 0.0 <= float(cached.residual_reduction_fraction) <= 1.0
+        assert cached.residual_reduction_fraction > 0.0
+
+
+def test_exact_residual_capture_separates_sample_and_parameter_spaces():
+    """The two valid projection ratios are bounded but generally unequal."""
+    o_cur = jnp.array(
+        [[2.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=jnp.float32
+    )
+    basis = jnp.array([[1.0], [0.0], [0.0]], dtype=jnp.float32)
+    sample_residual = jnp.array([3.0, 4.0], dtype=jnp.float32)
+    diagnostics = wssr.exact_residual_capture_diagnostics(
+        o_cur,
+        sample_residual,
+        basis,
+        applied_coefficients=jnp.array([1.0], dtype=jnp.float32),
+    )
+
+    assert diagnostics.sample_projection_ratio == pytest.approx(3.0 / 5.0)
+    assert diagnostics.parameter_projection_ratio == pytest.approx(
+        6.0 / np.sqrt(52.0)
+    )
+    assert diagnostics.applied_residual_norm_reduction == pytest.approx(
+        1.0 - np.sqrt(17.0) / 5.0
+    )
+    assert diagnostics.sample_projection_ratio != pytest.approx(
+        diagnostics.parameter_projection_ratio
+    )
+
+
+def test_exact_parameter_capture_accepts_an_explicit_full_update_target():
+    o_cur = jnp.eye(3, 2, dtype=jnp.float32)
+    basis = jnp.array([[1.0], [0.0], [0.0]], dtype=jnp.float32)
+    full_current_batch_update = jnp.array([3.0, 4.0, 0.0], dtype=jnp.float32)
+    diagnostics = wssr.exact_residual_capture_diagnostics(
+        o_cur,
+        sample_residual=jnp.array([1.0, 1.0], dtype=jnp.float32),
+        basis=basis,
+        applied_coefficients=jnp.array([0.0], dtype=jnp.float32),
+        parameter_target=full_current_batch_update,
+    )
+
+    assert diagnostics.parameter_projection_ratio == pytest.approx(3.0 / 5.0)
+
+
+def test_applied_residual_capture_metrics_are_bounded_and_consistent():
+    o_cur = jnp.array(
+        [[1.0, 2.0], [0.5, -1.0], [2.0, 0.25]], dtype=jnp.float32
+    )
+    basis, _ = jnp.linalg.qr(jnp.eye(3, 2, dtype=jnp.float32))
+    result = wssr.galerkin_residual_solution_recurrence(
+        o_cur,
+        jnp.array([0.8, -0.4], dtype=jnp.float32),
+        basis,
+        jnp.array([0.3, -0.2, 0.1], dtype=jnp.float32),
+        lambda_reg=1e-3,
+    )
+
+    assert 0.0 <= result.captured_sample_residual_ratio <= 1.0
+    assert 0.0 <= result.residual_norm_reduction <= 1.0
+    np.testing.assert_allclose(
+        result.residual_norm_reduction,
+        1.0 - jnp.sqrt(1.0 - result.residual_reduction_fraction),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_device_cholesky_galerkin_matches_host_fp64():
+    """The callback-free device backend solves the same regularized system."""
+    with jax.experimental.enable_x64():
+        o_cur = jnp.array(
+            [[1.0, 0.0, 2.0], [0.0, 1.0, -1.0],
+             [2.0, 1.0, 0.0], [-1.0, 2.0, 1.0]],
+            dtype=jnp.float64,
+        )
+        e_cur = jnp.array([0.4, -0.7, 0.3], dtype=jnp.float64)
+        prior = jnp.array([0.2, -0.1, 0.3, 0.4], dtype=jnp.float64)
+        basis, _ = jnp.linalg.qr(o_cur, mode="reduced")
+        host = wssr.galerkin_residual_solution_recurrence(
+            o_cur,
+            e_cur,
+            basis,
+            prior,
+            lambda_reg=1e-3,
+            solve_backend="host_fp64",
+        )
+        device = wssr.galerkin_residual_solution_recurrence(
+            o_cur,
+            e_cur,
+            basis,
+            prior,
+            lambda_reg=1e-3,
+            solve_backend="device_cholesky",
+        )
+
+        np.testing.assert_allclose(
+            device.correction, host.correction, rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            device.direction, host.direction, rtol=1e-10, atol=1e-10
+        )
+
+
+def test_device_cholesky_galerkin_jaxpr_has_no_callback():
+    """GPU-direct mode must remain a pure JAX computation after tracing."""
+    o_cur = jnp.array(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]], dtype=jnp.float32
+    )
+    e_cur = jnp.array([0.25, -0.5], dtype=jnp.float32)
+    prior = jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32)
+    basis, _ = jnp.linalg.qr(o_cur, mode="reduced")
+
+    def correction_fn(score, residual, subspace, history):
+        return wssr.galerkin_residual_solution_recurrence(
+            score,
+            residual,
+            subspace,
+            history,
+            lambda_reg=1e-3,
+            solve_backend="device_cholesky",
+        ).correction
+
+    jaxpr = str(
+        jax.make_jaxpr(correction_fn)(o_cur, e_cur, basis, prior)
+    )
+    assert "pure_callback" not in jaxpr
+    assert "cholesky" in jaxpr
+
+
+def test_galerkin_rejects_unknown_solve_backend():
+    o_cur = jnp.eye(2, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="solve_backend"):
+        wssr.galerkin_residual_solution_recurrence(
+            o_cur,
+            jnp.ones(2, dtype=jnp.float32),
+            o_cur,
+            jnp.zeros(2, dtype=jnp.float32),
+            lambda_reg=1e-3,
+            solve_backend="unknown",
+        )
+
+
+def test_delayed_refresh_reuses_stored_left_subspace():
+    o_aug = jnp.array(
+        [[1.0, 0.2, -0.4, 0.1], [0.3, 1.2, 0.7, -0.2],
+         [-0.5, 0.4, 1.1, 0.6], [0.8, -0.3, 0.2, 0.9],
+         [0.1, 0.5, -0.7, 1.3]],
+        dtype=jnp.float32,
+    )
+    warm_u, _ = jnp.linalg.qr(
+        jnp.array(
+            [[1.0, 0.2], [0.1, 1.0], [0.5, -0.3],
+             [-0.2, 0.4], [0.3, 0.6]],
+            dtype=jnp.float32,
+        ),
+        mode="reduced",
+    )
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=warm_u,
+        ek=jnp.zeros(2, dtype=jnp.float32),
+        sr_rank0=jnp.asarray(2, dtype=jnp.int32),
+        sr_rank=jnp.asarray(2, dtype=jnp.int32),
+        u=warm_u,
+        has_u=jnp.asarray(True),
+    )
+    reused_u, singular_values, vh, rank = (
+        wssr._wssr_right_svd_decomposition(
+            o_aug,
+            state,
+            jax.random.PRNGKey(7),
+            working_rank_max=2,
+            svd_maxiter_initial=3,
+            svd_maxiter_warm=2,
+            exact_first=False,
+            eps=1e-12,
+            reuse_warm_subspace=jnp.asarray(True),
+        )
+    )
+
+    outside = reused_u - warm_u @ (warm_u.T @ reused_u)
+    np.testing.assert_allclose(outside, 0.0, rtol=0.0, atol=2e-6)
+    np.testing.assert_allclose(
+        o_aug.T @ reused_u,
+        vh.T * singular_values[None, :],
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    assert rank == 2
+
+
+def test_lazy_fixed_basis_keeps_u_and_recomputes_exact_current_action():
+    """Lazy SSI must not rotate U between scheduled refreshes."""
+    o_aug = jnp.array(
+        [[1.0, 0.2, -0.4, 0.1], [0.3, 1.2, 0.7, -0.2],
+         [-0.5, 0.4, 1.1, 0.6], [0.8, -0.3, 0.2, 0.9],
+         [0.1, 0.5, -0.7, 1.3]],
+        dtype=jnp.float32,
+    )
+    warm_u, _ = jnp.linalg.qr(
+        jnp.array(
+            [[1.0, 0.2], [0.1, 1.0], [0.5, -0.3],
+             [-0.2, 0.4], [0.3, 0.6]],
+            dtype=jnp.float32,
+        ),
+        mode="reduced",
+    )
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=warm_u * jnp.array([2.0, 0.5]),
+        ek=jnp.zeros(2, dtype=jnp.float32),
+        sr_rank0=jnp.asarray(2, dtype=jnp.int32),
+        sr_rank=jnp.asarray(2, dtype=jnp.int32),
+        u=warm_u,
+        has_u=jnp.asarray(True),
+    )
+    reused_u, singular_values, vh, rank = (
+        wssr._wssr_right_svd_decomposition(
+            o_aug,
+            state,
+            jax.random.PRNGKey(11),
+            working_rank_max=2,
+            svd_maxiter_initial=3,
+            svd_maxiter_warm=2,
+            exact_first=False,
+            eps=1e-12,
+            reuse_warm_subspace=jnp.asarray(True),
+            fixed_warm_subspace=True,
+        )
+    )
+
+    np.testing.assert_allclose(reused_u, warm_u, rtol=0.0, atol=2e-6)
+    np.testing.assert_allclose(
+        vh.T * singular_values[None, :],
+        o_aug.T @ warm_u,
+        rtol=2e-6,
+        atol=2e-6,
+    )
+    assert rank == 2
+
+
+def test_full_current_batch_large_lambda_suppresses_correction():
+    o_cur = jnp.array(
+        [[1.0, 2.0], [0.5, -1.0], [2.0, 0.25]], dtype=jnp.float32
+    )
+    basis, _ = jnp.linalg.qr(jnp.eye(3, 2, dtype=jnp.float32))
+    prior = jnp.array([0.3, -0.2, 0.1], dtype=jnp.float32)
+    result = wssr.galerkin_residual_solution_recurrence(
+        o_cur,
+        jnp.array([0.8, -0.4], dtype=jnp.float32),
+        basis,
+        prior,
+        lambda_reg=1e12,
+    )
+
+    assert jnp.linalg.norm(result.correction) < 1e-9
+    chex.assert_trees_all_close(result.direction, prior, rtol=0.0, atol=1e-8)
+
+
+def test_full_current_batch_error_feedback_vanishes_for_complete_basis():
+    o_cur = jnp.array(
+        [[1.0, 2.0], [0.5, -1.0], [2.0, 0.25]], dtype=jnp.float32
+    )
+    result = wssr.galerkin_residual_solution_recurrence(
+        o_cur,
+        jnp.array([0.8, -0.4], dtype=jnp.float32),
+        jnp.eye(3, dtype=jnp.float32),
+        jnp.array([0.3, -0.2, 0.1], dtype=jnp.float32),
+        lambda_reg=1e-3,
+        error_feedback=jnp.array([0.2, -0.1, 0.3], dtype=jnp.float32),
+        enable_error_feedback=True,
+    )
+
+    chex.assert_trees_all_close(
+        result.error_feedback, jnp.zeros(3), rtol=0.0, atol=1e-7
+    )
+    assert result.error_feedback_clip_increment == 0
+
+
+def test_error_feedback_history_is_decayed_before_reinjection():
+    result = wssr.galerkin_residual_solution_recurrence(
+        jnp.zeros((3, 1), dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.array([[1.0], [0.0], [0.0]], dtype=jnp.float32),
+        jnp.zeros((3,), dtype=jnp.float32),
+        lambda_reg=1e-3,
+        error_feedback=jnp.array([0.0, 2.0, 0.0], dtype=jnp.float32),
+        enable_error_feedback=True,
+        error_feedback_decay=0.5,
+        error_feedback_norm_cap=100.0,
+        error_feedback_cap_reference="sample_residual",
+        solve_backend="device_cholesky",
+    )
+
+    np.testing.assert_allclose(
+        result.error_feedback,
+        jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    assert result.error_feedback_clip_increment == 0
+    assert result.error_feedback_to_sample_ratio == pytest.approx(1.0)
+
+
+def test_error_feedback_sample_residual_cap_and_health_ratios():
+    result = wssr.galerkin_residual_solution_recurrence(
+        jnp.array([[0.0], [100.0], [0.0]], dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.array([[1.0], [0.0], [0.0]], dtype=jnp.float32),
+        jnp.zeros((3,), dtype=jnp.float32),
+        lambda_reg=1e-3,
+        error_feedback=jnp.zeros((3,), dtype=jnp.float32),
+        enable_error_feedback=True,
+        error_feedback_decay=0.95,
+        error_feedback_norm_cap=10.0,
+        error_feedback_cap_reference="sample_residual",
+        solve_backend="device_cholesky",
+    )
+
+    assert result.error_feedback_uncapped_norm == pytest.approx(100.0)
+    assert result.error_feedback_cap_norm == pytest.approx(10.0)
+    assert result.error_feedback_norm == pytest.approx(10.0)
+    assert result.error_feedback_to_sample_ratio == pytest.approx(10.0)
+    assert result.error_feedback_to_parameter_conflict_ratio == pytest.approx(
+        0.1
+    )
+    assert result.error_feedback_clip_increment == 1
+
+
+def test_subspace_eta_zero_augmented_path_matches_current_batch_operator():
+    o_cur = jnp.arange(12.0, dtype=jnp.float32).reshape(3, 4)
+    e_cur = jnp.array([0.5, -0.25, 0.75, -1.0], dtype=jnp.float32)
+    state = wssr.WSSRCoreState(
+        sr_o=jnp.arange(15.0, dtype=jnp.float32).reshape(3, 5),
+        ek=jnp.arange(5.0, dtype=jnp.float32),
+        sr_rank0=jnp.asarray(3, dtype=jnp.int32),
+        sr_rank=jnp.asarray(3, dtype=jnp.int32),
+    )
+    o_aug, e_aug = wssr.augment_wssr_subspace_system(
+        o_cur, e_cur, state, eta=0.0
+    )
+
+    chex.assert_trees_all_close(
+        o_aug @ o_aug.T, o_cur @ o_cur.T, rtol=0.0, atol=1e-6
+    )
+    chex.assert_trees_all_close(
+        o_aug @ e_aug, o_cur @ e_cur, rtol=0.0, atol=1e-6
+    )
+
+
+def test_subspace_history_keeps_current_batch_at_unit_weight():
+    o_cur = jnp.ones((3, 2), dtype=jnp.float32)
+    e_cur = jnp.array([2.0, 4.0], dtype=jnp.float32)
+    state = wssr.WSSRCoreState(
+        sr_o=jnp.arange(15.0, dtype=jnp.float32).reshape(3, 5),
+        ek=jnp.arange(5.0, dtype=jnp.float32),
+        sr_rank0=jnp.asarray(2, dtype=jnp.int32),
+        sr_rank=jnp.asarray(3, dtype=jnp.int32),
+    )
+    o_aug, e_aug = wssr.augment_wssr_subspace_system(
+        o_cur, e_cur, state, eta=0.3
+    )
+
+    chex.assert_trees_all_close(o_aug[:, -2:], o_cur)
+    chex.assert_trees_all_close(e_aug[-2:], e_cur)
+    chex.assert_trees_all_close(
+        o_aug[:, :2], jnp.sqrt(0.3) * state.sr_o[:, :2]
+    )
+
+
+def test_bias_corrected_history_eta_ramps_to_target():
+    steps = jnp.arange(6, dtype=jnp.int32)
+    actual = jax.vmap(lambda step: wssr.bias_corrected_history_eta(0.99, step))(
+        steps
+    )
+    expected = jnp.array([0.0, 0.5, 2.0 / 3.0, 0.75, 0.8, 5.0 / 6.0])
+    chex.assert_trees_all_close(actual, expected)
+    assert wssr.bias_corrected_history_eta(0.8, 100) == pytest.approx(0.8)
+
+
+def test_wssr_relative_cutoff_is_independent_of_legacy_tikhonov_lambda():
+    state, o_aug, e_aug, u, singular_values, vh = _spectral_regularization_fixture()
+    damping = 0.1
+    relative_cutoff = 0.3
+    result = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        state,
+        u,
+        singular_values,
+        vh,
+        damping=damping,
+        norm_constraint=10.0,
+        sr_rank_max=state.sr_o.shape[1],
+        sr_scale=1.1,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=relative_cutoff,
+        tikhonov_lambda=-1.0,
+    )
+
+    force = o_aug @ e_aug
+    retained = singular_values / singular_values[0] > relative_cutoff
+    legacy_lambda = jnp.square(damping * singular_values[0])
+    expected = u @ (
+        (u.T @ force)
+        * retained.astype(u.dtype)
+        / (jnp.square(singular_values) + legacy_lambda)
+    )
+    np.testing.assert_allclose(
+        result.grad_like_update, expected, rtol=1e-5, atol=1e-5
+    )
+    assert int(result.active_rank) == 2
 
 
 def test_wssr_update_rejects_invalid_spectral_regularization():
@@ -1930,6 +3234,175 @@ def test_initialize_wssr_warm_svd_core_state_store_warm_u_shapes():
     assert full_state.sr_o.shape == derived_state.sr_o.shape == (4, 5)
 
 
+def test_explicit_current_block_operator_matches_materialized_augmentation():
+    o_cur = jnp.array(
+        [[0.4, -0.2, 0.1], [0.3, 0.5, -0.4], [-0.1, 0.2, 0.6]],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.2, -0.1, 0.3], dtype=jnp.float32)
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        3, 2, 2, dtype=jnp.float32, store_warm_u=False
+    )._replace(
+        sr_o=jnp.array(
+            [[0.5, 0.0], [0.1, 0.4], [-0.2, 0.3]], dtype=jnp.float32
+        ),
+        ek=jnp.array([0.7, -0.2], dtype=jnp.float32),
+        sr_rank0=jnp.array(2),
+    )
+    eta = 0.3
+    o_aug, e_aug = wssr.augment_wssr_system(o_cur, e_cur, state, eta)
+    probe = jnp.arange(15, dtype=jnp.float32).reshape(5, 3) / 10.0
+    left_probe = jnp.arange(9, dtype=jnp.float32).reshape(3, 3) / 7.0
+
+    np.testing.assert_allclose(
+        wssr.explicit_current_augmented_matmat(
+            o_cur, state, eta, probe
+        ),
+        o_aug @ probe,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        wssr.explicit_current_augmented_rmatmat(
+            o_cur, state, eta, left_probe
+        ),
+        o_aug.T @ left_probe,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        wssr.explicit_current_augmented_matvec(
+            o_cur, state, eta, e_aug
+        ),
+        o_aug @ e_aug,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_explicit_current_block_core_matches_materialized_residual_recurrence():
+    o_cur = jnp.array(
+        [
+            [0.4, -0.2, -0.2],
+            [0.1, 0.3, -0.4],
+            [-0.5, 0.2, 0.3],
+            [0.2, -0.1, -0.1],
+        ],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.2, -0.3, 0.1], dtype=jnp.float32)
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        4, 3, 3, dtype=jnp.float32, store_warm_u=False
+    )
+    e_aug = wssr.augment_wssr_residuals(e_cur, state, eta=0.0)
+    o_aug, _ = wssr.augment_wssr_system(o_cur, e_cur, state, eta=0.0)
+    prior = jnp.array([0.05, -0.02, 0.01, 0.03], dtype=jnp.float32)
+    kwargs = dict(
+        key=jax.random.PRNGKey(7),
+        damping=0.001,
+        norm_constraint=0.001,
+        sr_rank_max=3,
+        svd_maxiter_initial=4,
+        svd_maxiter_warm=2,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.001,
+        mixed_precision_solve=True,
+        solution_prior=prior,
+        solution_recurrence_mode="residual",
+    )
+    explicit = wssr.wssr_warm_svd_right_core_update(
+        o_aug, e_aug, state, **kwargs
+    )
+    blockwise = (
+        wssr.wssr_warm_svd_right_core_update_explicit_current_blocks(
+            o_cur,
+            e_cur,
+            e_aug,
+            state,
+            eta=0.0,
+            **kwargs,
+        )
+    )
+
+    np.testing.assert_allclose(
+        blockwise.grad_like_update,
+        explicit.grad_like_update,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        blockwise.state.sr_o,
+        explicit.state.sr_o,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        blockwise.state.ek,
+        explicit.state.ek,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+
+def test_explicit_current_block_core_matches_materialized_dual_cap_complement():
+    o_cur = jnp.array(
+        [
+            [0.4, -0.2, -0.2],
+            [0.1, 0.3, -0.4],
+            [-0.5, 0.2, 0.3],
+            [0.2, -0.1, -0.1],
+        ],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.2, -0.3, 0.1], dtype=jnp.float32)
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        4, 2, 2, dtype=jnp.float32, store_warm_u=False
+    )
+    e_aug = wssr.augment_wssr_residuals(e_cur, state, eta=0.0)
+    o_aug, _ = wssr.augment_wssr_system(o_cur, e_cur, state, eta=0.0)
+    kwargs = dict(
+        key=jax.random.PRNGKey(11),
+        damping=0.001,
+        norm_constraint=0.001,
+        sr_rank_max=2,
+        svd_maxiter_initial=4,
+        svd_maxiter_warm=2,
+        svd_working_rank=2,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=1e-4,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.001,
+        experimental_mode="adaptive_complement",
+        adaptive_complement_beta=0.1,
+        adaptive_complement_beta_function=0.1,
+    )
+    explicit = wssr.wssr_warm_svd_right_core_update(
+        o_aug,
+        e_aug,
+        state,
+        complement_function_operator=o_cur,
+        **kwargs,
+    )
+    blockwise = wssr.wssr_warm_svd_right_core_update_explicit_current_blocks(
+        o_cur, e_cur, e_aug, state, eta=0.0, **kwargs
+    )
+
+    np.testing.assert_allclose(
+        blockwise.grad_like_update,
+        explicit.grad_like_update,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        blockwise.state.sr_o, explicit.state.sr_o, rtol=2e-5, atol=2e-6
+    )
+
+
 def test_recover_u_from_sr_o_masks_inactive_and_zero_columns():
     sr_o = jnp.array(
         [
@@ -2542,6 +4015,100 @@ def test_wssr_warm_svd_right_core_jitted_matches_eager_update_and_history():
     assert jnp.all(jnp.isfinite(jitted.state.u))
 
 
+def test_wssr_warm_svd_right_exact_first_matches_exact_reference_and_is_once():
+    """Exact-first matches rank-r SVD, stores it, then takes the warm branch."""
+    key = jax.random.PRNGKey(713)
+    o_aug = jax.random.normal(key, (9, 7), dtype=jnp.float32)
+    e_aug = jax.random.normal(jax.random.fold_in(key, 1), (7,), dtype=jnp.float32)
+    warm_state = wssr.initialize_wssr_warm_svd_core_state(
+        9, 3, 3, dtype=jnp.float32, store_warm_u=True
+    )
+    exact_state = wssr.WSSRCoreState(
+        warm_state.sr_o,
+        warm_state.ek,
+        warm_state.sr_rank0,
+        warm_state.sr_rank,
+    )
+    kwargs = dict(
+        damping=3e-4,
+        norm_constraint=1e-3,
+        sr_rank_max=3,
+        constrain_update_norm=False,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+    )
+    exact_first = wssr.wssr_warm_svd_right_core_update(
+        o_aug,
+        e_aug,
+        warm_state,
+        jax.random.fold_in(key, 2),
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        exact_first=True,
+        **kwargs,
+    )
+    ref_u, ref_s, ref_vh = jnp.linalg.svd(o_aug, full_matrices=False)
+    reference = wssr._wssr_update_from_svd(
+        o_aug,
+        e_aug,
+        exact_state,
+        ref_u[:, :3],
+        ref_s[:3],
+        ref_vh[:3, :],
+        rank_update_max=3,
+        sr_scale=1.1,
+        **kwargs,
+    )
+    chex.assert_trees_all_close(
+        exact_first.grad_like_update,
+        reference.grad_like_update,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+    exact_u = jnp.linalg.svd(o_aug, full_matrices=False)[0][:, :3]
+    chex.assert_trees_all_close(
+        exact_first.state.u @ exact_first.state.u.T,
+        exact_u @ exact_u.T,
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    assert bool(exact_first.state.has_u)
+
+    o_aug_2 = o_aug + 0.01 * jax.random.normal(
+        jax.random.fold_in(key, 3), o_aug.shape, dtype=o_aug.dtype
+    )
+    e_aug_2 = e_aug + 0.01 * jax.random.normal(
+        jax.random.fold_in(key, 4), e_aug.shape, dtype=e_aug.dtype
+    )
+    common = dict(
+        o_aug=o_aug_2,
+        e_aug=e_aug_2,
+        state=exact_first.state,
+        key=jax.random.fold_in(key, 5),
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        svd_working_rank=3,
+        **kwargs,
+    )
+    second_exact_flag = wssr.wssr_warm_svd_right_core_update(
+        exact_first=True, **common
+    )
+    second_normal = wssr.wssr_warm_svd_right_core_update(
+        exact_first=False, **common
+    )
+    chex.assert_trees_all_equal(second_exact_flag, second_normal)
+
+    diagnostic, diagnostic_metrics = (
+        wssr.wssr_warm_svd_right_reference_diagnostic_core_update(
+            exact_first=False, **common
+        )
+    )
+    chex.assert_trees_all_equal(diagnostic, second_normal)
+    assert all(bool(jnp.all(jnp.isfinite(x))) for x in diagnostic_metrics.values())
+
+
 def test_wssr_warm_svd_right_rank_growth_caps_to_working_width_and_stores_history():
     state = wssr.initialize_wssr_warm_svd_core_state(
         num_params=4,
@@ -2728,6 +4295,54 @@ def test_initialize_optimizer_dispatches_wssr_warm_svd_right_and_constructs_stat
     assert key.shape == (2,)
 
 
+def test_wssr_warm_svd_right_native_proximal_uses_previous_direction_state():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.constrain_norm = False
+    opt.sr_rank = 2
+    opt.sr_rank_max = 5
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.experimental_mode = "native_proximal"
+    opt.native_proximal_gamma = 3e-4
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(17),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRComplementEMAOptimizerState)
+    assert jnp.all(state.complement_ema == 0)
+
+    params, data, state, metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    first_direction = state.complement_ema
+    assert jnp.all(jnp.isfinite(first_direction))
+    assert jnp.linalg.norm(first_direction) > 0
+    assert metrics["wssr_diag_native_proximal_gamma"] == pytest.approx(3e-4)
+
+    _, _, state, metrics, _ = update_param_fn(params, data, state, key)
+    assert jnp.all(jnp.isfinite(state.complement_ema))
+    assert jnp.linalg.norm(state.complement_ema - first_direction) > 0
+    assert jnp.isfinite(metrics["wssr_diag_native_proximal_previous_cosine"])
+
+
 def test_initialize_wssr_warm_svd_right_uses_thin_storage_rank_when_set():
     params = _tiny_params()
     data = _tiny_positions()
@@ -2783,6 +4398,49 @@ def test_initialize_wssr_warm_svd_right_rejects_storage_rank_below_initial_rank(
         )
 
 
+def test_wssr_function_constraint_applies_euclidean_safety_afterward():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 1.0
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.norm_constraint_mode = "function_space"
+    opt.function_norm_constraint = 1e6
+    opt.euclidean_safety_constraint = 1e-8
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(23),
+        apply_pmap=False,
+    )
+    new_params, _, _, metrics, _ = update_param_fn(
+        params, data, state, key
+    )
+    displacement = jax.tree_util.tree_map(
+        lambda new, old: new - old, new_params, params
+    )
+
+    assert float(wssr.tree_l2_norm(displacement)) <= 1.0001e-4
+    assert bool(metrics["wssr_euclidean_safety_active"])
+    assert float(metrics["wssr_euclidean_safety_scale"]) < 1.0
+
+
 @pytest.mark.parametrize(
     "field,value,match",
     [
@@ -2793,6 +4451,40 @@ def test_initialize_wssr_warm_svd_right_rejects_storage_rank_below_initial_rank(
 def test_initialize_wssr_warm_svd_right_rejects_invalid_regularization_config(
     field, value, match
 ):
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    setattr(config.vmc.optimizer.wssr_warm_svd_right, field, value)
+
+    with pytest.raises(ValueError, match=match):
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(0),
+            apply_pmap=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("euclidean_safety_constraint", 0.0, "euclidean_safety_constraint"),
+        (
+            "adaptive_complement_beta_function",
+            -0.1,
+            "adaptive_complement_beta_function",
+        ),
+    ],
+)
+def test_initialize_wssr_rejects_invalid_dual_cap_config(field, value, match):
     params = _tiny_params()
     data = _tiny_positions()
     config = default_config.get_default_config()
@@ -2848,6 +4540,214 @@ def test_wssr_warm_svd_right_update_returns_rank_diagnostics():
         sr_rank_max=config.vmc.optimizer.wssr_warm_svd_right.sr_rank_max,
         svd_working_rank=config.vmc.optimizer.wssr_warm_svd_right.svd_working_rank,
     )
+
+
+def test_wssr_long_history_candidate_uses_eta_ramp_and_finite_mixed_solve():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.constrain_norm = False
+    opt.eta = 0.99
+    opt.eta_bias_correction = True
+    opt.mixed_precision_solve = True
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.1
+    opt.tikhonov_lambda = 0.5
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(29),
+        apply_pmap=False,
+    )
+    params, data, state, first_metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    assert first_metrics["wssr_eta_used"] == pytest.approx(0.0)
+    assert bool(first_metrics["wssr_diag_finite"])
+    assert jnp.isfinite(first_metrics["wssr_diag_raw_direction_norm"])
+
+    _, _, _, second_metrics, _ = update_param_fn(params, data, state, key)
+    assert second_metrics["wssr_eta_used"] == pytest.approx(0.5)
+    assert bool(second_metrics["wssr_diag_finite"])
+    assert jnp.isfinite(second_metrics["wssr_diag_raw_direction_norm"])
+
+
+@pytest.mark.parametrize("mode", ["naive", "residual"])
+def test_wssr_solution_recurrence_tracks_full_parameter_history(mode):
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.constrain_norm = False
+    opt.eta = 0.0
+    opt.mixed_precision_solve = True
+    opt.solution_recurrence_mode = mode
+    opt.solution_recurrence_mu = 0.99
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.1
+    opt.tikhonov_lambda = 0.5
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(37),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRSolutionRecurrenceOptimizerState)
+    assert jnp.linalg.norm(state.solution_state) == pytest.approx(0.0)
+
+    params, data, state, first_metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    assert bool(first_metrics["wssr_diag_finite"])
+    assert first_metrics["wssr_solution_prior_norm"] == pytest.approx(0.0)
+    assert jnp.linalg.norm(state.solution_state) > 0.0
+
+    _, _, next_state, second_metrics, _ = update_param_fn(
+        params, data, state, key
+    )
+    assert bool(second_metrics["wssr_diag_finite"])
+    assert second_metrics["wssr_solution_prior_norm"] > 0.0
+    assert second_metrics["wssr_solution_correction_norm"] > 0.0
+    _assert_tree_all_finite(next_state)
+
+
+def test_full_current_batch_device_cholesky_runs_through_optimizer():
+    """The configured GPU-direct backend reaches the production update path."""
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.constrain_norm = False
+    opt.eta = 0.0
+    opt.mixed_precision_solve = True
+    opt.solution_recurrence_mode = "residual"
+    opt.solution_recurrence_mu = 0.99
+    opt.residual_evaluation = "full_current_batch"
+    opt.galerkin_solve_backend = "device_cholesky"
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.1
+    opt.tikhonov_lambda = 0.5
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(107),
+        apply_pmap=False,
+    )
+    params, data, state, first_metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    _, _, next_state, second_metrics, _ = update_param_fn(
+        params, data, state, key
+    )
+
+    assert bool(first_metrics["wssr_diag_finite"])
+    assert bool(second_metrics["wssr_diag_finite"])
+    assert second_metrics["wssr_solution_prior_norm"] > 0.0
+    assert second_metrics["wssr_solution_correction_norm"] > 0.0
+    _assert_tree_all_finite(next_state)
+
+
+def test_wssr_multilevel_complement_uses_two_buffers_and_resets_at_boundary():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.constrain_norm = False
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.experimental_mode = "adaptive_complement"
+    opt.experimental_target_rank = 2
+    opt.adaptive_complement_beta = 0.001
+    opt.complement_weight = 0.0001
+    opt.complement_state_decay = 0.99
+    opt.multilevel_complement_period = 2
+    opt.multilevel_complement_cosine_threshold = 0.0
+
+    update_param_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(5),
+        apply_pmap=False,
+    )
+    assert isinstance(state, wssr.WSSRMultilevelComplementOptimizerState)
+
+    params, data, state, metrics, key = update_param_fn(
+        params, data, state, key
+    )
+    assert int(state.complement_step) == 1
+    assert int(metrics["wssr_diag_multilevel_boundary"]) == 0
+
+    _, _, state, metrics, _ = update_param_fn(params, data, state, key)
+    assert int(state.complement_step) == 2
+    assert int(metrics["wssr_diag_multilevel_boundary"]) == 1
+    assert jnp.all(state.complement_ema == 0)
+    assert jnp.all(state.complement_ema_b == 0)
+    assert state.complement_weight_a == 0
+    assert state.complement_weight_b == 0
 
 
 def test_initialize_optimizer_dispatches_wssr_warm_svd_right_matfree_and_constructs_state():
@@ -3050,6 +4950,328 @@ def test_wssr_warm_svd_right_integrated_two_updates_have_no_nans():
     assert not np.allclose(key_2, key_1)
 
 
+@pytest.mark.parametrize(
+    ("experimental_mode", "curvature_mode"),
+    [
+        ("cluster_envelope", "scalar"),
+        ("cluster_envelope", "rayleigh_ritz"),
+        ("cluster_envelope_ritz", "scalar"),
+        ("cluster_envelope_ritz_ef", "scalar"),
+        ("cluster_envelope_ritz_selected", "scalar"),
+        ("cluster_envelope_ritz_snr", "scalar"),
+    ],
+)
+def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
+    experimental_mode,
+    curvature_mode,
+):
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.05
+    opt.constrain_norm = True
+    opt.eta = 0.0
+    opt.eta_S = 0.0
+    opt.eta_g = 0.0
+    opt.sr_rank = 2
+    opt.sr_rank_max = 2
+    opt.sr_storage_rank = 2
+    opt.svd_working_rank = 2
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.tikhonov_lambda = 0.1
+    opt.complement_weight = 0.0
+    opt.experimental_mode = experimental_mode
+    opt.cluster_envelope_rank = 2
+    opt.cluster_envelope_history = 3
+    if experimental_mode == "cluster_envelope_ritz_selected":
+        opt.cluster_envelope_capacity = 3
+    opt.cluster_envelope_alpha = 0.2
+    opt.cluster_envelope_gamma = -1.0
+    opt.cluster_envelope_curvature_mode = curvature_mode
+
+    update_param_fn, state_0, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(81),
+        apply_pmap=False,
+    )
+    if experimental_mode == "cluster_envelope_ritz_ef":
+        assert isinstance(state_0, wssr.WSSRClusterEnvelopeEFOptimizerState)
+    else:
+        assert isinstance(state_0, wssr.WSSRClusterEnvelopeOptimizerState)
+    assert state_0.envelope_history.shape == (3, 4)
+
+    params_1, data_1, state_1, metrics_1, key_1 = update_param_fn(
+        params, data, state_0, key
+    )
+    params_2, _, state_2, metrics_2, _ = update_param_fn(
+        params_1, data_1, state_1, key_1
+    )
+
+    _assert_tree_all_finite(params_2)
+    assert state_1.envelope_count == 1
+    assert state_2.envelope_count == 2
+    assert jnp.any(state_2.envelope_history != 0.0)
+    if experimental_mode == "cluster_envelope_ritz_ef":
+        assert jnp.linalg.norm(state_2.error_feedback_state) > 0.0
+        assert "wssr_envelope_ef_clip_count" in metrics_2
+    for metrics in (metrics_1, metrics_2):
+        assert metrics["wssr_diag_finite"] == 1
+        assert "wssr_envelope_numerical_rank" in metrics
+        assert jnp.all(jnp.isfinite(jnp.asarray(list(metrics.values()))))
+    if experimental_mode == "cluster_envelope_ritz_selected":
+        assert metrics_2["wssr_envelope_capacity"] == 3
+        assert metrics_2["wssr_envelope_selected_history_count"] == 1
+    if experimental_mode == "cluster_envelope_ritz_snr":
+        assert 0.0 <= metrics_2["wssr_envelope_snr_weight_min"] <= 1.0
+        assert 0.0 <= metrics_2["wssr_envelope_snr_weight_max"] <= 1.0
+        assert metrics_2["wssr_envelope_snr_cluster_count"] >= 1
+
+
+def test_wssr_transported_gradient_uses_actual_constrained_parameter_delta():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 10.0
+    opt.constrain_norm = True
+    opt.norm_constraint = 0.01
+    opt.eta = 0.8
+    opt.enable_gradient_transport = True
+    opt.sr_rank = 2
+    opt.sr_rank_max = 3
+    opt.sr_storage_rank = 3
+    opt.svd_working_rank = 3
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.spectral_regularization = "tikhonov"
+    opt.complement_weight = 0.0
+    opt.relative_singular_value_cutoff = 0.0
+    opt.tikhonov_lambda = 0.1
+
+    update_param_fn, state_0, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(73),
+        apply_pmap=False,
+    )
+    assert isinstance(state_0, wssr.WSSRTransportedGradientOptimizerState)
+    flat_params_0, _ = jax.flatten_util.ravel_pytree(params)
+    np.testing.assert_allclose(state_0.previous_theta, flat_params_0)
+    assert not bool(state_0.transport_initialized)
+
+    params_1, data_1, state_1, metrics_1, key_1 = update_param_fn(
+        params, data, state_0, key
+    )
+    flat_params_1, _ = jax.flatten_util.ravel_pytree(params_1)
+    actual_delta = flat_params_1 - flat_params_0
+    np.testing.assert_allclose(state_1.previous_theta, flat_params_0)
+    assert bool(state_1.transport_initialized)
+    assert metrics_1["transport_norm"] == pytest.approx(0.0)
+    assert jnp.linalg.norm(actual_delta) == pytest.approx(
+        jnp.sqrt(opt.norm_constraint), rel=1e-5
+    )
+
+    local_energies_1 = jax.vmap(_local_energy_fn, in_axes=(None, 0))(
+        params_1, data_1
+    )
+    energy_1, _, _ = physics.core.get_clipped_energies_and_stats(
+        local_energies_1,
+        config.vmc.nchains,
+        None,
+        config.vmc.nan_safe,
+    )
+    o_cur_1, _ = wssr.center_and_scale_score_matrix(
+        _log_psi_apply, params_1, data_1
+    )
+    e_cur_1 = wssr.center_and_scale_energy_residuals(
+        local_energies_1, energy_1
+    )
+    current_gradient_1 = o_cur_1 @ e_cur_1
+    operator_delta = wssr.apply_wssr_history_operator(
+        state_1.core_state, actual_delta
+    )
+    current_operator_delta = o_cur_1 @ (o_cur_1.T @ actual_delta)
+    expected_transport = (
+        opt.eta * (state_1.transported_gradient + operator_delta)
+        + (1.0 - opt.eta) * current_gradient_1
+    )
+
+    _, _, state_2, metrics_2, _ = update_param_fn(
+        params_1, data_1, state_1, key_1
+    )
+    np.testing.assert_allclose(
+        state_2.transported_gradient,
+        expected_transport,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        metrics_2["transport_norm"], jnp.linalg.norm(operator_delta), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        metrics_2["gradient_norm"], jnp.linalg.norm(current_gradient_1), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        metrics_2["transport_ratio"],
+        jnp.linalg.norm(operator_delta) / jnp.linalg.norm(current_gradient_1),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        metrics_2["S_transport_norm_ema"],
+        jnp.linalg.norm(operator_delta),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        metrics_2["S_transport_norm_current"],
+        jnp.linalg.norm(current_operator_delta),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        metrics_2["transport_ratio_ema"],
+        jnp.linalg.norm(operator_delta) / jnp.linalg.norm(current_gradient_1),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        metrics_2["transport_ratio_current"],
+        jnp.linalg.norm(current_operator_delta)
+        / jnp.linalg.norm(current_gradient_1),
+        rtol=1e-5,
+    )
+
+
+def test_wssr_reliability_diagnostics_do_not_change_two_step_update():
+    """Reliability metrics must be observational, including on a warm step."""
+    params = _tiny_params()
+    data = _tiny_positions()
+
+    def _make_config(enabled):
+        config = default_config.get_default_config()
+        config.vmc.nchains = data.shape[0]
+        config.vmc.optimizer_type = "wssr_warm_svd_right"
+        opt = config.vmc.optimizer.wssr_warm_svd_right
+        opt.schedule_type = "constant"
+        opt.learning_rate = 0.04
+        opt.constrain_norm = False
+        opt.sr_rank = 2
+        opt.sr_rank_max = 3
+        opt.sr_storage_rank = 3
+        opt.svd_working_rank = 3
+        opt.svd_maxiter_initial = 3
+        opt.svd_maxiter_warm = 2
+        opt.spectral_regularization = "tikhonov"
+        opt.relative_singular_value_cutoff = 3e-4
+        opt.tikhonov_lambda = 1e-3
+        opt.complement_weight = 0.0
+        opt.reliability_diagnostics = enabled
+        return config
+
+    baseline_fn, baseline_state, baseline_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        _make_config(False).vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(19),
+        apply_pmap=False,
+    )
+    diagnostic_fn, diagnostic_state, diagnostic_key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        _make_config(True).vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(19),
+        apply_pmap=False,
+    )
+
+    baseline_params = diagnostic_params = params
+    baseline_data = diagnostic_data = data
+    diagnostic_metrics = None
+    for _ in range(2):
+        (
+            baseline_params,
+            baseline_data,
+            baseline_state,
+            _,
+            baseline_key,
+        ) = baseline_fn(
+            baseline_params, baseline_data, baseline_state, baseline_key
+        )
+        (
+            diagnostic_params,
+            diagnostic_data,
+            diagnostic_state,
+            diagnostic_metrics,
+            diagnostic_key,
+        ) = diagnostic_fn(
+            diagnostic_params,
+            diagnostic_data,
+            diagnostic_state,
+            diagnostic_key,
+        )
+
+    assert_pytree_allclose(
+        diagnostic_params, baseline_params, rtol=1e-6, atol=1e-7
+    )
+    assert_pytree_allclose(
+        diagnostic_state, baseline_state, rtol=1e-6, atol=1e-7
+    )
+    np.testing.assert_allclose(diagnostic_data, baseline_data)
+    np.testing.assert_array_equal(diagnostic_key, baseline_key)
+    reliability_metrics = {
+        key: value
+        for key, value in diagnostic_metrics.items()
+        if key.startswith("wssr_reliability_")
+    }
+    assert set(reliability_metrics) == {
+        "wssr_reliability_update_weighted_ritz_residual",
+        "wssr_reliability_previous_subspace_retained_fraction",
+        "wssr_reliability_temporal_update_novelty",
+        "wssr_reliability_ssi_comparison_iterations",
+        "wssr_reliability_ssi_update_relative_change",
+        "wssr_reliability_ssi_update_cosine",
+        "wssr_reliability_raw_energy_median",
+        "wssr_reliability_raw_energy_mad",
+        "wssr_reliability_raw_tail_q99_robust_z",
+        "wssr_reliability_raw_tail_max_robust_z",
+        "wssr_reliability_raw_tail_fraction_gt_10_robust_z",
+    }
+    assert jnp.all(
+        jnp.isfinite(jnp.asarray(list(reliability_metrics.values())))
+    )
+    assert diagnostic_metrics[
+        "wssr_reliability_ssi_comparison_iterations"
+    ] == jnp.asarray(1)
+
+
 def test_wssr_warm_svd_right_two_step_no_persistent_u_matches_persistent_metrics():
     params = _tiny_params()
     data = _tiny_positions()
@@ -3178,4 +5400,520 @@ def test_initialize_wssr_warm_svd_right_matfree_rejects_pmap_until_supported():
     else:
         raise AssertionError(
             "Expected wssr_warm_svd_right_matfree to reject apply_pmap=True"
+        )
+
+
+def test_current_subspace_uniform_spectrum_matches_current_tikhonov_without_history():
+    o_cur = jnp.array(
+        [
+            [1.0, -0.5, 0.2, 0.7, -0.1],
+            [0.3, 0.8, -0.4, 0.1, -0.8],
+            [-0.2, 0.6, 0.9, -0.5, -0.8],
+            [0.4, -0.1, 0.5, -0.9, 0.1],
+        ],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.7, -0.2, 0.5, -0.4, -0.6], dtype=jnp.float32)
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        4, 3, 3, dtype=jnp.float32, store_warm_u=True
+    )
+    common = dict(
+        key=jax.random.PRNGKey(91),
+        damping=1e-3,
+        norm_constraint=1.0,
+        sr_rank_max=3,
+        sr_scale=1.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        exact_first=True,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.1,
+    )
+    reference = wssr.wssr_warm_svd_right_core_update(
+        o_cur,
+        e_cur,
+        state,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        **common,
+    )
+    candidate = wssr.wssr_current_subspace_reduced_metric_core_update(
+        o_cur,
+        e_cur,
+        state,
+        eta_S=0.8,
+        history_mode="uniform_spectrum",
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        candidate.grad_like_update,
+        reference.grad_like_update,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    assert candidate.active_rank == reference.active_rank
+    np.testing.assert_allclose(candidate.diagnostics.eta_by_mode, 0.0)
+
+
+def test_anisotropic_matrix_history_weights_tail_more_than_head():
+    diagnostics = wssr.spectral_position_history_weights(
+        jnp.array([100.0, 10.0, 1.0, 0.1]),
+        jnp.ones((4,), dtype=bool),
+        jnp.asarray(True),
+        eta_max=0.95,
+        num_samples=1000,
+        noise_scale=1.0,
+    )
+
+    eta = np.asarray(diagnostics.eta_by_mode)
+    assert np.all(np.diff(eta) > 0.0)
+    assert diagnostics.eta_tail > diagnostics.eta_head
+    assert 0.0 < diagnostics.eta_spectral_mean < 0.95
+    assert diagnostics.current_weight == pytest.approx(
+        1.0 - float(diagnostics.eta_spectral_mean), abs=1e-7
+    )
+
+
+def test_anisotropic_matrix_augmentation_recovers_legacy_for_uniform_weights():
+    o_cur = jnp.array([[1.0, -0.5, 0.2], [0.3, 0.8, -0.4]])
+    e_cur = jnp.array([0.2, -0.1, -0.1])
+    state = wssr.WSSRWarmSVDCoreState(
+        sr_o=jnp.array([[1.2, 0.0], [0.0, 0.7]]),
+        ek=jnp.array([0.3, -0.2]),
+        sr_rank0=jnp.asarray(2),
+        sr_rank=jnp.asarray(2),
+        u=jnp.eye(2),
+        has_u=jnp.asarray(True),
+    )
+    eta = 0.3
+    diagnostics = wssr.WSSRAnisotropicMatrixHistoryDiagnostics(
+        eta_by_mode=jnp.full((2,), eta),
+        eta_mean=jnp.asarray(eta),
+        eta_head=jnp.asarray(eta),
+        eta_tail=jnp.asarray(eta),
+        eta_spectral_mean=jnp.asarray(eta),
+        current_weight=jnp.asarray(1.0 - eta),
+        noise_floor=jnp.asarray(0.0),
+    )
+    candidate = wssr.augment_wssr_anisotropic_matrix_history(
+        o_cur, state, diagnostics
+    )
+    reference, _ = wssr.augment_wssr_system(o_cur, e_cur, state, eta)
+
+    np.testing.assert_allclose(candidate, reference, rtol=1e-7, atol=1e-7)
+
+
+def test_anisotropic_matrix_history_matches_current_tikhonov_without_history():
+    o_cur = jnp.array(
+        [
+            [1.0, -0.5, 0.2, 0.7, -0.1],
+            [0.3, 0.8, -0.4, 0.1, -0.8],
+            [-0.2, 0.6, 0.9, -0.5, -0.8],
+            [0.4, -0.1, 0.5, -0.9, 0.1],
+        ],
+        dtype=jnp.float32,
+    )
+    e_cur = jnp.array([0.7, -0.2, 0.5, -0.4, -0.6], dtype=jnp.float32)
+    state = wssr.initialize_wssr_warm_svd_core_state(
+        4, 3, 3, dtype=jnp.float32, store_warm_u=True
+    )
+    common = dict(
+        key=jax.random.PRNGKey(96),
+        damping=1e-3,
+        norm_constraint=1.0,
+        sr_rank_max=3,
+        sr_scale=1.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        exact_first=True,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.1,
+    )
+    reference = wssr.wssr_warm_svd_right_core_update(
+        o_cur,
+        e_cur,
+        state,
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        **common,
+    )
+    candidate = wssr.wssr_anisotropic_matrix_history_core_update(
+        o_cur,
+        e_cur,
+        state,
+        eta_S=0.95,
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        candidate.grad_like_update,
+        reference.grad_like_update,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        candidate.state.sr_o @ candidate.state.sr_o.T,
+        reference.state.sr_o @ reference.state.sr_o.T,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(candidate.diagnostics.eta_by_mode, 0.0)
+    assert candidate.diagnostics.current_weight == pytest.approx(1.0)
+
+
+def test_anisotropic_matrix_eta_zero_matches_two_current_only_steps():
+    o_first = jnp.array(
+        [
+            [1.0, -0.5, 0.2, 0.7],
+            [0.3, 0.8, -0.4, 0.1],
+            [-0.2, 0.6, 0.9, -0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    o_second = jnp.array(
+        [
+            [0.9, -0.4, 0.1, 0.8],
+            [0.4, 0.7, -0.5, 0.2],
+            [-0.1, 0.5, 0.8, -0.6],
+        ],
+        dtype=jnp.float32,
+    )
+    e_first = jnp.array([0.5, -0.3, 0.2, -0.4], dtype=jnp.float32)
+    e_second = jnp.array([0.4, -0.2, 0.3, -0.5], dtype=jnp.float32)
+    initial = wssr.initialize_wssr_warm_svd_core_state(
+        3, 3, 3, dtype=jnp.float32, store_warm_u=True
+    )
+    common = dict(
+        damping=1e-3,
+        norm_constraint=1.0,
+        sr_rank_max=3,
+        sr_scale=1.0,
+        svd_maxiter_initial=2,
+        svd_maxiter_warm=1,
+        exact_first=True,
+        svd_working_rank=3,
+        constrain_update_norm=False,
+        relative_singular_value_cutoff=0.0,
+        tikhonov_lambda=0.1,
+    )
+
+    reference_first = wssr.wssr_warm_svd_right_core_update(
+        o_first,
+        e_first,
+        initial,
+        key=jax.random.PRNGKey(97),
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        **common,
+    )
+    candidate_first = wssr.wssr_anisotropic_matrix_history_core_update(
+        o_first,
+        e_first,
+        initial,
+        key=jax.random.PRNGKey(97),
+        eta_S=0.0,
+        **common,
+    )
+    reference_second = wssr.wssr_warm_svd_right_core_update(
+        o_second,
+        e_second,
+        reference_first.state,
+        key=jax.random.PRNGKey(98),
+        spectral_regularization="tikhonov",
+        complement_weight=0.0,
+        **common,
+    )
+    candidate_second = wssr.wssr_anisotropic_matrix_history_core_update(
+        o_second,
+        e_second,
+        candidate_first.state,
+        key=jax.random.PRNGKey(98),
+        eta_S=0.0,
+        **common,
+    )
+
+    np.testing.assert_allclose(
+        candidate_second.grad_like_update,
+        reference_second.grad_like_update,
+        rtol=3e-5,
+        atol=3e-6,
+    )
+    np.testing.assert_allclose(
+        candidate_second.state.sr_o @ candidate_second.state.sr_o.T,
+        reference_second.state.sr_o @ reference_second.state.sr_o.T,
+        rtol=3e-5,
+        atol=3e-6,
+    )
+
+
+def test_cluster_adaptive_spectral_history_weights_tail_more_than_head():
+    eigenvalues = jnp.array([100.0, 10.0, 1.0, 0.1])
+    history = jnp.diag(eigenvalues)
+    _, diagnostics = wssr.average_current_reduced_metric(
+        eigenvalues,
+        history,
+        jnp.ones((4,), dtype=bool),
+        jnp.asarray(True),
+        "cluster_adaptive",
+        eta_max=0.95,
+        num_samples=1000,
+        cluster_gap_threshold=0.01,
+        noise_scale=1.0,
+        drift_scale=1.0,
+        history_total_mass=jnp.sum(eigenvalues),
+    )
+
+    eta = np.asarray(diagnostics.eta_by_mode)
+    assert np.all(np.diff(eta) > 0.0)
+    assert diagnostics.eta_tail > diagnostics.eta_head
+    assert diagnostics.drift_ratio_mean == pytest.approx(0.0, abs=1e-7)
+
+
+def test_uniform_spectrum_history_ignores_historical_off_diagonal_rotation():
+    eigenvalues = jnp.array([3.0, 1.0])
+    history = jnp.array([[2.0, 0.9], [0.9, 0.5]])
+    metric, diagnostics = wssr.average_current_reduced_metric(
+        eigenvalues,
+        history,
+        jnp.ones((2,), dtype=bool),
+        jnp.asarray(True),
+        "uniform_spectrum",
+        eta_max=0.25,
+        num_samples=1000,
+    )
+
+    expected = jnp.diag(jnp.array([2.75, 0.875]))
+    np.testing.assert_allclose(metric, expected, rtol=1e-7, atol=1e-7)
+    np.testing.assert_allclose(diagnostics.eta_by_mode, 0.25)
+
+
+def test_cluster_adaptive_reduced_metric_is_rotation_invariant_inside_cluster():
+    eigenvalues = jnp.array([2.0, 2.0], dtype=jnp.float32)
+    history = jnp.array([[1.5, 0.2], [0.2, 1.0]], dtype=jnp.float32)
+    angle = 0.37
+    rotation = jnp.array(
+        [
+            [jnp.cos(angle), -jnp.sin(angle)],
+            [jnp.sin(angle), jnp.cos(angle)],
+        ],
+        dtype=jnp.float32,
+    )
+    kwargs = dict(
+        active_mask=jnp.ones((2,), dtype=bool),
+        has_history=jnp.asarray(True),
+        mode="cluster_adaptive",
+        eta_max=0.8,
+        num_samples=1000,
+        cluster_gap_threshold=0.01,
+        noise_scale=1.0,
+        drift_scale=1.0,
+        history_total_mass=jnp.trace(history),
+    )
+    metric_a, diagnostics_a = wssr.average_current_reduced_metric(
+        eigenvalues, history, **kwargs
+    )
+    metric_b, diagnostics_b = wssr.average_current_reduced_metric(
+        eigenvalues, rotation.T @ history @ rotation, **kwargs
+    )
+    force_a = jnp.array([0.4, -0.7], dtype=jnp.float32)
+    force_b = rotation.T @ force_a
+    damping = 0.1
+    direction_a = jnp.linalg.solve(
+        metric_a + damping * jnp.eye(2), force_a
+    )
+    direction_b = rotation @ jnp.linalg.solve(
+        metric_b + damping * jnp.eye(2), force_b
+    )
+
+    np.testing.assert_allclose(direction_b, direction_a, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        diagnostics_b.eta_by_mode,
+        diagnostics_a.eta_by_mode,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+
+def test_current_subspace_spectral_history_integrates_and_logs_diagnostics():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.02
+    opt.constrain_norm = False
+    opt.eta = 0.0
+    opt.eta_S = 0.8
+    opt.eta_g = 0.0
+    opt.reduced_metric_history_mode = "cluster_adaptive"
+    opt.spectral_regularization = "tikhonov"
+    opt.tikhonov_lambda = 1e-3
+    opt.relative_singular_value_cutoff = 0.0
+    opt.complement_weight = 0.0
+    opt.sr_rank = 2
+    opt.sr_rank_max = 2
+    opt.sr_storage_rank = 2
+    opt.svd_working_rank = 2
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.exact_first = True
+
+    update_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(92),
+        apply_pmap=False,
+    )
+    next_params, _, next_state, metrics, _ = update_fn(
+        params, data, state, key
+    )
+
+    _assert_tree_all_finite(next_params)
+    _assert_wssr_state_all_finite(next_state.core_state)
+    assert set(metrics).issuperset(
+        {
+            "wssr_spectral_history_eta_mean",
+            "wssr_spectral_history_eta_head",
+            "wssr_spectral_history_eta_tail",
+            "wssr_spectral_history_noise_floor",
+            "wssr_spectral_history_overlap",
+            "wssr_spectral_history_cluster_count",
+            "wssr_spectral_history_drift_ratio_mean",
+        }
+    )
+    assert next_state.core_state.ek.shape == (2,)
+    np.testing.assert_allclose(next_state.core_state.ek, 0.0)
+
+
+def test_current_subspace_spectral_history_rejects_gradient_ema():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.eta_S = 0.8
+    opt.eta_g = 0.3
+    opt.reduced_metric_history_mode = "uniform_spectrum"
+    opt.spectral_regularization = "tikhonov"
+    opt.tikhonov_lambda = 1e-3
+    opt.complement_weight = 0.0
+
+    with pytest.raises(ValueError, match="requires eta_g=0"):
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(93),
+            apply_pmap=False,
+        )
+
+
+def test_anisotropic_matrix_history_integrates_without_gradient_memory():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.schedule_type = "constant"
+    opt.learning_rate = 0.02
+    opt.constrain_norm = False
+    opt.eta = 0.0
+    opt.eta_S = 0.8
+    opt.eta_g = 0.0
+    opt.anisotropic_matrix_history = True
+    opt.spectral_regularization = "tikhonov"
+    opt.tikhonov_lambda = 1e-3
+    opt.relative_singular_value_cutoff = 0.0
+    opt.complement_weight = 0.0
+    opt.sr_rank = 2
+    opt.sr_rank_max = 2
+    opt.sr_storage_rank = 2
+    opt.svd_working_rank = 2
+    opt.svd_maxiter_initial = 2
+    opt.svd_maxiter_warm = 1
+    opt.exact_first = True
+
+    update_fn, state, key = initialize_optimizer(
+        _log_psi_apply,
+        _local_energy_fn,
+        None,
+        config.vmc,
+        params,
+        data,
+        lambda x: x,
+        lambda d, p: d,
+        jax.random.PRNGKey(94),
+        apply_pmap=False,
+    )
+    params_1, data_1, state_1, _, key_1 = update_fn(
+        params, data, state, key
+    )
+    params_2, _, state_2, metrics, _ = update_fn(
+        params_1, data_1, state_1, key_1
+    )
+
+    _assert_tree_all_finite(params_2)
+    _assert_wssr_state_all_finite(state_2.core_state)
+    assert set(metrics).issuperset(
+        {
+            "wssr_anisotropic_matrix_eta_mean",
+            "wssr_anisotropic_matrix_eta_head",
+            "wssr_anisotropic_matrix_eta_tail",
+            "wssr_anisotropic_matrix_eta_spectral_mean",
+            "wssr_anisotropic_matrix_current_weight",
+            "wssr_anisotropic_matrix_noise_floor",
+        }
+    )
+    assert metrics["wssr_anisotropic_matrix_eta_tail"] >= metrics[
+        "wssr_anisotropic_matrix_eta_head"
+    ]
+    np.testing.assert_allclose(state_2.core_state.ek, 0.0)
+
+
+def test_anisotropic_matrix_history_rejects_gradient_ema():
+    params = _tiny_params()
+    data = _tiny_positions()
+    config = default_config.get_default_config()
+    config.vmc.nchains = data.shape[0]
+    config.vmc.optimizer_type = "wssr_warm_svd_right"
+    opt = config.vmc.optimizer.wssr_warm_svd_right
+    opt.eta_S = 0.8
+    opt.eta_g = 0.3
+    opt.anisotropic_matrix_history = True
+    opt.spectral_regularization = "tikhonov"
+    opt.tikhonov_lambda = 1e-3
+    opt.complement_weight = 0.0
+
+    with pytest.raises(ValueError, match="requires eta_g=0"):
+        initialize_optimizer(
+            _log_psi_apply,
+            _local_energy_fn,
+            None,
+            config.vmc,
+            params,
+            data,
+            lambda x: x,
+            lambda d, p: d,
+            jax.random.PRNGKey(95),
+            apply_pmap=False,
         )

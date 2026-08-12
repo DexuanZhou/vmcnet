@@ -240,8 +240,21 @@ def initialize_optimizer(
         )
         return update_param_fn, optimizer_state, key
     elif vmc_config.optimizer_type == "wssr_warm_svd_right":
+        burst_payload = vmc_config.optimizer.wssr_warm_svd_right.get(
+            "burst_diagnostics_payload", False
+        )
+        reliability_diagnostics = (
+            vmc_config.optimizer.wssr_warm_svd_right.get(
+                "reliability_diagnostics", False
+            )
+        )
         energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(
-            local_energy_fn, vmc_config.nchains, clipping_fn, vmc_config.nan_safe
+            local_energy_fn,
+            vmc_config.nchains,
+            clipping_fn,
+            vmc_config.nan_safe,
+            record_diagnostic_payload=burst_payload,
+            record_raw_local_energies=reliability_diagnostics,
         )
         (
             update_param_fn,
