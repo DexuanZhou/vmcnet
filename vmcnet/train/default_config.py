@@ -513,6 +513,8 @@ def get_default_vmc_config() -> Dict:
                 # complete enclosing subspace instead of replacing its
                 # anisotropic curvature by one mean eigenvalue.
                 "cluster_envelope_curvature_mode": "scalar",
+                # Used only by the default-disabled ``grassmann_ritz`` mode.
+                "grassmann_smoothing_alpha": 0.5,
                 # Default-disabled cross-half-batch empirical shrinkage for
                 # the current-batch Ritz solve. Near-degenerate Ritz modes
                 # share one SNR weight, avoiding basis-dependent filtering.

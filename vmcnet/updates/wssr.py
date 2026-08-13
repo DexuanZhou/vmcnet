@@ -4644,6 +4644,8 @@ def compute_wssr_cluster_envelope_update(
     curvature_mode="scalar",
     enable_cross_batch_snr_shrinkage=False,
     snr_cluster_gap_threshold=0.05,
+    enable_grassmann_smoothing=False,
+    grassmann_smoothing_alpha=0.5,
     error_feedback_state=None,
     enable_rotation_error_feedback=False,
     rotation_error_feedback_decay=0.95,
@@ -4701,6 +4703,7 @@ def compute_wssr_cluster_envelope_update(
     )
 
     history_blocks = max(envelope_length - 1, 0)
+    grassmann_overlap_singular_values = jnp.ones((k,), dtype=u.dtype)
     if history_blocks > 0:
         block_ids = jnp.repeat(jnp.arange(history_blocks), k)
         history_mask = (block_ids < envelope_count).astype(u.dtype)
@@ -4754,6 +4757,30 @@ def compute_wssr_cluster_envelope_update(
         history_selection_gain = jnp.asarray(0.0, dtype=u.dtype)
         envelope_basis = current_basis
 
+    if enable_grassmann_smoothing:
+        if history_blocks != 1:
+            raise ValueError(
+                "grassmann_ritz requires cluster_envelope_history=2"
+            )
+        previous_basis = envelope_history[:, :k]
+
+        def _smooth(_):
+            return wssr_experimental.procrustes_grassmann_average(
+                previous_basis,
+                current_basis,
+                grassmann_smoothing_alpha,
+            )
+
+        def _current(_):
+            return current_basis, jnp.ones((k,), dtype=u.dtype)
+
+        envelope_basis, grassmann_overlap_singular_values = jax.lax.cond(
+            envelope_count > 0,
+            _smooth,
+            _current,
+            operand=None,
+        )
+
     orthonormal_envelope, numerical_rank, gram_eigenvalues = (
         wssr_experimental.orthonormalize_basis_envelope(
             envelope_basis,
@@ -4780,7 +4807,18 @@ def compute_wssr_cluster_envelope_update(
         orthonormal_envelope.T @ effective_gradient
     )
 
-    if history_blocks > 0:
+    if enable_grassmann_smoothing:
+        history_numerical_rank = jnp.sum(
+            grassmann_overlap_singular_values > envelope_eigenvalue_cutoff
+        ).astype(jnp.int32)
+        novelty_fraction = jnp.clip(
+            1.0
+            - jnp.sum(jnp.square(grassmann_overlap_singular_values))
+            / jnp.maximum(jnp.asarray(k, dtype=u.dtype), 1.0),
+            0.0,
+            1.0,
+        )
+    elif history_blocks > 0:
         projected_current, history_numerical_rank, _ = (
             wssr_experimental.project_onto_basis_envelope(
                 weighted_history,
@@ -4974,7 +5012,13 @@ def compute_wssr_cluster_envelope_update(
         jnp.where(rank > 0, jnp.array(True), state.has_u),
     )
 
-    if history_blocks > 0:
+    if enable_grassmann_smoothing:
+        next_history = jnp.zeros_like(envelope_history)
+        next_history = next_history.at[:, :k].set(
+            orthonormal_envelope[:, :k]
+        )
+        next_count = jnp.asarray(1, dtype=envelope_count.dtype)
+    elif history_blocks > 0:
         retained_history = envelope_history[:, : max(history_blocks - 1, 0) * k]
         next_history = jnp.concatenate(
             [current_basis, retained_history], axis=1
@@ -5053,6 +5097,18 @@ def compute_wssr_cluster_envelope_update(
             singular_values.shape[0] > k, dtype=jnp.int32
         ),
         "wssr_envelope_current_novelty_fraction": novelty_fraction,
+        "wssr_grassmann_alpha": jnp.asarray(
+            grassmann_smoothing_alpha, dtype=u.dtype
+        ),
+        "wssr_grassmann_history_active": (
+            (envelope_count > 0) & enable_grassmann_smoothing
+        ).astype(jnp.int32),
+        "wssr_grassmann_overlap_mean": jnp.mean(
+            grassmann_overlap_singular_values
+        ),
+        "wssr_grassmann_overlap_min": jnp.min(
+            grassmann_overlap_singular_values
+        ),
         "wssr_envelope_gradient_capture_fraction": (
             cluster_gradient_norm / jnp.maximum(gradient_norm, eps)
         ),
@@ -6041,6 +6097,7 @@ def construct_wssr_warm_svd_right_update_param_fn(
         "cluster_envelope_ritz_ef",
         "cluster_envelope_ritz_selected",
         "cluster_envelope_ritz_snr",
+        "grassmann_ritz",
     )
     use_cluster_envelope_ef = experimental_mode == "cluster_envelope_ritz_ef"
     use_cluster_envelope_selection = (
@@ -6057,6 +6114,14 @@ def construct_wssr_warm_svd_right_update_param_fn(
             )
         if envelope_length < 1:
             raise ValueError("cluster_envelope_history must be positive")
+        if experimental_mode == "grassmann_ritz" and envelope_length != 2:
+            raise ValueError(
+                "grassmann_ritz requires cluster_envelope_history=2"
+            )
+        if not 0.0 <= optimizer_config.get(
+            "grassmann_smoothing_alpha", 0.5
+        ) <= 1.0:
+            raise ValueError("grassmann_smoothing_alpha must be in [0, 1]")
         if optimizer_config.get("cluster_snr_gap_threshold", 0.05) < 0.0:
             raise ValueError("cluster_snr_gap_threshold must be nonnegative")
         envelope_capacity = optimizer_config.get(
@@ -6723,6 +6788,7 @@ def construct_wssr_warm_svd_right_update_param_fn(
                         "cluster_envelope_ritz_ef",
                         "cluster_envelope_ritz_selected",
                         "cluster_envelope_ritz_snr",
+                        "grassmann_ritz",
                     )
                     else optimizer_config.get("cluster_envelope_alpha", 0.2)
                 ),
@@ -6739,6 +6805,7 @@ def construct_wssr_warm_svd_right_update_param_fn(
                         "cluster_envelope_ritz_ef",
                         "cluster_envelope_ritz_selected",
                         "cluster_envelope_ritz_snr",
+                        "grassmann_ritz",
                     )
                     else optimizer_config.get(
                         "cluster_envelope_curvature_mode", "scalar"
@@ -6746,6 +6813,12 @@ def construct_wssr_warm_svd_right_update_param_fn(
                 ),
                 enable_cross_batch_snr_shrinkage=(
                     experimental_mode == "cluster_envelope_ritz_snr"
+                ),
+                enable_grassmann_smoothing=(
+                    experimental_mode == "grassmann_ritz"
+                ),
+                grassmann_smoothing_alpha=optimizer_config.get(
+                    "grassmann_smoothing_alpha", 0.5
                 ),
                 snr_cluster_gap_threshold=optimizer_config.get(
                     "cluster_snr_gap_threshold", 0.05
@@ -7806,6 +7879,7 @@ def initialize_wssr_warm_svd_right(
         "cluster_envelope_ritz_ef",
         "cluster_envelope_ritz_selected",
         "cluster_envelope_ritz_snr",
+        "grassmann_ritz",
     )
     use_cluster_envelope_ef = (
         optimizer_config.get("experimental_mode", "none")

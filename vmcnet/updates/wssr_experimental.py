@@ -4,10 +4,42 @@ import jax.numpy as jnp
 from jax import lax
 from vmcnet.utils.typing import Array
 
-MODES=("none","cluster","near_tail","adaptive_complement","residual_optimal_complement","capped_near_tail","smooth","force_aware","iterative_complement","native_proximal","cluster_envelope","cluster_envelope_ritz","cluster_envelope_ritz_ef","cluster_envelope_ritz_selected","cluster_envelope_ritz_snr")
+MODES=("none","cluster","near_tail","adaptive_complement","residual_optimal_complement","capped_near_tail","smooth","force_aware","iterative_complement","native_proximal","cluster_envelope","cluster_envelope_ritz","cluster_envelope_ritz_ef","cluster_envelope_ritz_selected","cluster_envelope_ritz_snr","grassmann_ritz")
 
 def validate_mode(mode:str)->None:
     if mode not in MODES: raise ValueError(f"experimental_mode must be one of {MODES}")
+
+
+def procrustes_grassmann_average(
+    previous_basis: Array,
+    current_basis: Array,
+    alpha: float,
+) -> Tuple[Array, Array]:
+    """Procrustes-align and average two equal-width orthonormal bases.
+
+    This removes sign, ordering, and within-cluster gauge changes before a QR
+    retraction back to the Grassmann manifold. It is intended only for a small
+    top cluster because the overlap costs O(N_param * k**2).
+    """
+    if previous_basis.shape != current_basis.shape:
+        raise ValueError("Grassmann bases must have the same shape")
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("Grassmann alpha must be in [0, 1]")
+
+    # For M = U_prev.T U_cur = L diag(s) R.T, U_cur (R L.T) is the
+    # representative aligned to U_prev.
+    overlap = previous_basis.T @ current_basis
+    left, overlap_singular_values, right_h = jnp.linalg.svd(
+        overlap, full_matrices=False
+    )
+    aligned_current = current_basis @ (right_h.T @ left.T)
+    alpha_array = jnp.asarray(alpha, dtype=current_basis.dtype)
+    blended = (
+        (1.0 - alpha_array) * previous_basis
+        + alpha_array * aligned_current
+    )
+    averaged_basis, _ = jnp.linalg.qr(blended, mode="reduced")
+    return averaged_basis, overlap_singular_values
 
 def cluster_effective_rank(s:Array,target:int,threshold:float,max_rank:int)->Array:
     """First r>=target with gap(s[r-1],s[r])>threshold, else max_rank."""

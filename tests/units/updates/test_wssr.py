@@ -11,6 +11,7 @@ import vmcnet.train.default_config as default_config
 from vmcnet.updates.parse_optimizer_config import initialize_optimizer
 from tests.test_utils import assert_pytree_allclose
 from vmcnet.updates import wssr
+from vmcnet.updates import wssr_experimental
 
 
 def _tiny_params():
@@ -4959,6 +4960,7 @@ def test_wssr_warm_svd_right_integrated_two_updates_have_no_nans():
         ("cluster_envelope_ritz_ef", "scalar"),
         ("cluster_envelope_ritz_selected", "scalar"),
         ("cluster_envelope_ritz_snr", "scalar"),
+        ("grassmann_ritz", "scalar"),
     ],
 )
 def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
@@ -4988,7 +4990,9 @@ def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
     opt.complement_weight = 0.0
     opt.experimental_mode = experimental_mode
     opt.cluster_envelope_rank = 2
-    opt.cluster_envelope_history = 3
+    opt.cluster_envelope_history = (
+        2 if experimental_mode == "grassmann_ritz" else 3
+    )
     if experimental_mode == "cluster_envelope_ritz_selected":
         opt.cluster_envelope_capacity = 3
     opt.cluster_envelope_alpha = 0.2
@@ -5011,7 +5015,10 @@ def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
         assert isinstance(state_0, wssr.WSSRClusterEnvelopeEFOptimizerState)
     else:
         assert isinstance(state_0, wssr.WSSRClusterEnvelopeOptimizerState)
-    assert state_0.envelope_history.shape == (3, 4)
+    expected_history_width = (
+        2 if experimental_mode == "grassmann_ritz" else 4
+    )
+    assert state_0.envelope_history.shape == (3, expected_history_width)
 
     params_1, data_1, state_1, metrics_1, key_1 = update_param_fn(
         params, data, state_0, key
@@ -5022,7 +5029,9 @@ def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
 
     _assert_tree_all_finite(params_2)
     assert state_1.envelope_count == 1
-    assert state_2.envelope_count == 2
+    assert state_2.envelope_count == (
+        1 if experimental_mode == "grassmann_ritz" else 2
+    )
     assert jnp.any(state_2.envelope_history != 0.0)
     if experimental_mode == "cluster_envelope_ritz_ef":
         assert jnp.linalg.norm(state_2.error_feedback_state) > 0.0
@@ -5038,6 +5047,51 @@ def test_cluster_envelope_integrated_two_updates_expand_state_and_remain_finite(
         assert 0.0 <= metrics_2["wssr_envelope_snr_weight_min"] <= 1.0
         assert 0.0 <= metrics_2["wssr_envelope_snr_weight_max"] <= 1.0
         assert metrics_2["wssr_envelope_snr_cluster_count"] >= 1
+    if experimental_mode == "grassmann_ritz":
+        assert metrics_2["wssr_grassmann_history_active"] == 1
+        assert 0.0 <= metrics_2["wssr_grassmann_overlap_min"] <= 1.0
+        assert 0.0 <= metrics_2["wssr_grassmann_overlap_mean"] <= 1.0
+
+
+def test_procrustes_grassmann_average_removes_gauge_and_has_endpoints():
+    previous = jnp.array(
+        [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=jnp.float32
+    )
+    current_same = jnp.array(
+        [[0.0, -1.0], [1.0, 0.0], [0.0, 0.0]], dtype=jnp.float32
+    )
+    averaged, overlap_s = wssr_experimental.procrustes_grassmann_average(
+        previous, current_same, 0.5
+    )
+    np.testing.assert_allclose(
+        averaged @ averaged.T,
+        previous @ previous.T,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(overlap_s, jnp.ones(2), rtol=0.0, atol=1e-6)
+
+    current_rotated = jnp.array(
+        [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]], dtype=jnp.float32
+    )
+    at_previous, _ = wssr_experimental.procrustes_grassmann_average(
+        previous, current_rotated, 0.0
+    )
+    at_current, _ = wssr_experimental.procrustes_grassmann_average(
+        previous, current_rotated, 1.0
+    )
+    np.testing.assert_allclose(
+        at_previous @ at_previous.T,
+        previous @ previous.T,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        at_current @ at_current.T,
+        current_rotated @ current_rotated.T,
+        rtol=0.0,
+        atol=1e-6,
+    )
 
 
 def test_wssr_transported_gradient_uses_actual_constrained_parameter_delta():
