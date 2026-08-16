@@ -49,7 +49,6 @@ def _get_config_from_reload(
             "cluster_snr_gap_threshold",
             "near_tail_modes",
             "adaptive_complement_beta",
-            "adaptive_complement_beta_function",
             "adaptive_complement_beta_final",
             "adaptive_complement_decay_steps",
             "adaptive_complement_decay_start",
@@ -62,7 +61,6 @@ def _get_config_from_reload(
             "force_aware_krylov_vectors",
             "iterative_complement_iterations",
             "native_proximal_gamma",
-            "euclidean_safety_constraint",
             "relative_singular_value_cutoff",
             "tikhonov_lambda",
             "eta_S",
@@ -95,8 +93,6 @@ def _get_config_from_reload(
             "subspace_refresh_mode",
             "drift_gate_monitoring",
             "drift_gate_hypothetical_eta_g",
-            "norm_constraint_mode",
-            "function_norm_constraint",
         ):
             if key not in warm_right_config:
                 warm_right_config[key] = default_warm_right[key]
@@ -110,8 +106,6 @@ def _get_config_from_reload(
             "diagnostics_replay_dir",
             "diagnostics_decomposition",
             "mixed_precision_solve",
-            "norm_constraint_mode",
-            "function_norm_constraint",
         ):
             if key not in spring_config:
                 spring_config[key] = default_spring[key]

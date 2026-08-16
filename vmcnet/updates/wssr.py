@@ -21,11 +21,7 @@ from vmcnet.utils.typing import (
     UpdateDataFn,
 )
 
-from .update_param_fns import (
-    UpdateParamFn,
-    constrain_update_function_norm,
-    update_metrics_with_noclip,
-)
+from .update_param_fns import UpdateParamFn, update_metrics_with_noclip
 from . import wssr_experimental
 
 
@@ -266,49 +262,6 @@ class WSSRSVDResult(NamedTuple):
     grad_like_update: Array
     state: WSSRCoreState
     active_rank: Array
-
-
-class WSSRReducedMetricHistoryDiagnostics(NamedTuple):
-    """Diagnostics for current-subspace reduced-metric averaging."""
-
-    eta_by_mode: Array
-    eta_mean: Array
-    eta_head: Array
-    eta_tail: Array
-    noise_floor: Array
-    history_overlap: Array
-    cluster_count: Array
-    drift_ratio_mean: Array
-
-
-class WSSRReducedMetricHistoryResult(NamedTuple):
-    """Update and telemetry from spectrum-only WSSR history."""
-
-    grad_like_update: Array
-    state: WSSRWarmSVDCoreState
-    active_rank: Array
-    diagnostics: WSSRReducedMetricHistoryDiagnostics
-
-
-class WSSRAnisotropicMatrixHistoryDiagnostics(NamedTuple):
-    """Diagnostics for spectral-position weights on the legacy S history."""
-
-    eta_by_mode: Array
-    eta_mean: Array
-    eta_head: Array
-    eta_tail: Array
-    eta_spectral_mean: Array
-    current_weight: Array
-    noise_floor: Array
-
-
-class WSSRAnisotropicMatrixHistoryResult(NamedTuple):
-    """Update and telemetry from anisotropically weighted matrix history."""
-
-    grad_like_update: Array
-    state: WSSRWarmSVDCoreState
-    active_rank: Array
-    diagnostics: WSSRAnisotropicMatrixHistoryDiagnostics
 
 
 class AvgMinSRSVDHistoryResult(NamedTuple):
@@ -1447,313 +1400,6 @@ def _wssr_resolve_spectral_controls(
     return cutoff, lambda_reg
 
 
-_WSSR_REDUCED_METRIC_HISTORY_MODES = (
-    "none",
-    "uniform_spectrum",
-    "cluster_adaptive",
-)
-
-
-def spectral_position_history_weights(
-    history_eigenvalues: Array,
-    active_mask: Array,
-    has_history: Array,
-    eta_max: chex.Numeric,
-    num_samples: int,
-    noise_scale: chex.Numeric = 1.0,
-    eps: chex.Numeric = 1e-12,
-) -> WSSRAnisotropicMatrixHistoryDiagnostics:
-    """Return suggestion-1 weights for the legacy matrix-history factor.
-
-    The columns of the ordinary WSSR history factor are ordered approximate
-    eigenmodes, with squared column norms equal to their retained eigenvalues.
-    This rule keeps that augmented-factor representation and replaces its one
-    scalar history weight by ``delta_i``.  The SNR proxy is
-    ``lambda_i / (lambda_1 / sqrt(N_s))``; consequently reliable leading modes
-    use little history and noisy tail modes use more.
-
-    A single scalar current-block weight is still needed because sample columns
-    do not have a one-to-one correspondence with parameter-space eigenmodes.
-    We use the spectral-mass-weighted mean history weight. It exactly recovers
-    ``1-eta`` when all history weights are uniform and preserves aggregate
-    trace scaling when consecutive spectra are comparable.
-    """
-    if not 0.0 <= eta_max < 1.0:
-        raise ValueError("anisotropic matrix-history eta_max must be in [0, 1)")
-    if num_samples <= 0:
-        raise ValueError("num_samples must be positive")
-    if noise_scale <= 0.0:
-        raise ValueError("noise_scale must be positive")
-
-    dtype = history_eigenvalues.dtype
-    eps_array = jnp.asarray(eps, dtype=dtype)
-    active = active_mask.astype(bool)
-    active_float = active.astype(dtype)
-    active_count = jnp.sum(active.astype(jnp.int32))
-    usable_history = jnp.asarray(has_history) & (active_count > 0)
-    eigenvalues = jnp.where(
-        active, jnp.maximum(history_eigenvalues, 0.0), 0.0
-    )
-    leading = jnp.maximum(eigenvalues[0], eps_array)
-    estimated_noise = (
-        jnp.asarray(noise_scale, dtype=dtype)
-        * leading
-        / jnp.sqrt(jnp.asarray(num_samples, dtype=dtype))
-    )
-    mode_snr = eigenvalues / jnp.maximum(estimated_noise, eps_array)
-    eta_by_mode = (
-        jnp.asarray(eta_max, dtype=dtype)
-        / (1.0 + mode_snr)
-        * active_float
-        * usable_history.astype(dtype)
-    )
-
-    def _masked_mean(values, mask):
-        mask_float = mask.astype(dtype)
-        return jnp.sum(values * mask_float) / jnp.maximum(
-            jnp.sum(mask_float), jnp.asarray(1.0, dtype=dtype)
-        )
-
-    spectral_mass = jnp.sum(eigenvalues)
-    eta_spectral_mean = jnp.sum(eta_by_mode * eigenvalues) / jnp.maximum(
-        spectral_mass, eps_array
-    )
-    eta_spectral_mean = jnp.where(
-        usable_history, eta_spectral_mean, jnp.asarray(0.0, dtype=dtype)
-    )
-    quartile = jnp.maximum(active_count // 4, 1)
-    indices = jnp.arange(history_eigenvalues.shape[0], dtype=jnp.int32)
-    head_mask = active & (indices < quartile)
-    tail_mask = active & (indices >= jnp.maximum(active_count - quartile, 0))
-    return WSSRAnisotropicMatrixHistoryDiagnostics(
-        eta_by_mode=eta_by_mode,
-        eta_mean=_masked_mean(eta_by_mode, active),
-        eta_head=_masked_mean(eta_by_mode, head_mask),
-        eta_tail=_masked_mean(eta_by_mode, tail_mask),
-        eta_spectral_mean=eta_spectral_mean,
-        current_weight=jnp.where(
-            usable_history,
-            1.0 - eta_spectral_mean,
-            jnp.asarray(1.0, dtype=dtype),
-        ),
-        noise_floor=jnp.where(
-            usable_history,
-            estimated_noise,
-            jnp.asarray(0.0, dtype=dtype),
-        ),
-    )
-
-
-def augment_wssr_anisotropic_matrix_history(
-    o_cur: Array,
-    state: WSSRWarmSVDCoreState,
-    diagnostics: WSSRAnisotropicMatrixHistoryDiagnostics,
-) -> Array:
-    """Apply per-mode history weights to the legacy augmented factor."""
-    history_width = state.sr_o.shape[1]
-    history_mask = (
-        jnp.arange(history_width) < state.sr_rank0
-    ).astype(o_cur.dtype)
-    weighted_history = state.sr_o * jnp.sqrt(
-        diagnostics.eta_by_mode * history_mask
-    )[None, :]
-    weighted_current = o_cur * jnp.sqrt(diagnostics.current_weight)
-    return jnp.concatenate([weighted_history, weighted_current], axis=1)
-
-
-def average_current_reduced_metric(
-    current_eigenvalues: Array,
-    history_metric_in_current_basis: Array,
-    active_mask: Array,
-    has_history: Array,
-    mode: str,
-    eta_max: chex.Numeric,
-    num_samples: int,
-    cluster_gap_threshold: chex.Numeric = 0.01,
-    noise_scale: chex.Numeric = 1.0,
-    drift_scale: chex.Numeric = 1.0,
-    history_total_mass: Optional[Array] = None,
-    eps: chex.Numeric = 1e-12,
-) -> Tuple[Array, WSSRReducedMetricHistoryDiagnostics]:
-    """Average curvature history inside the *current* SSI subspace.
-
-    ``current_eigenvalues`` and ``history_metric_in_current_basis`` are both
-    expressed in the current left-singular basis.  History therefore changes
-    only the reduced metric used by the solve; it never participates in the
-    construction of the current basis itself.
-
-    ``uniform_spectrum`` averages only diagonal Ritz values.  The
-    ``cluster_adaptive`` mode retains complete blocks inside near-degenerate
-    spectral clusters and assigns one history weight to every block.  Its
-    weight decreases when the current eigenvalue has high sample-size-scaled
-    SNR or when the historical block disagrees with the current block by more
-    than the estimated Monte Carlo noise floor.  Sharing the weight across a
-    cluster makes the rule invariant to rotations inside that cluster.
-    """
-    if mode not in _WSSR_REDUCED_METRIC_HISTORY_MODES:
-        raise ValueError(
-            "reduced metric history mode must be one of "
-            f"{_WSSR_REDUCED_METRIC_HISTORY_MODES}"
-        )
-    if not 0.0 <= eta_max < 1.0:
-        raise ValueError("reduced metric eta_max must be in [0, 1)")
-    if num_samples <= 0:
-        raise ValueError("num_samples must be positive")
-    if cluster_gap_threshold < 0.0:
-        raise ValueError("cluster_gap_threshold must be nonnegative")
-    if noise_scale <= 0.0:
-        raise ValueError("noise_scale must be positive")
-    if drift_scale < 0.0:
-        raise ValueError("drift_scale must be nonnegative")
-
-    dtype = current_eigenvalues.dtype
-    eps_array = jnp.asarray(eps, dtype=dtype)
-    active = active_mask.astype(bool)
-    active_float = active.astype(dtype)
-    active_count = jnp.sum(active.astype(jnp.int32))
-    has_usable_history = jnp.asarray(has_history) & (active_count > 0)
-    current_eigenvalues = jnp.where(
-        active, jnp.maximum(current_eigenvalues, 0.0), 0.0
-    )
-    current_metric = jnp.diag(current_eigenvalues)
-    history_metric = 0.5 * (
-        history_metric_in_current_basis
-        + history_metric_in_current_basis.T
-    )
-
-    leading = jnp.maximum(current_eigenvalues[0], eps_array)
-    noise_floor = (
-        jnp.asarray(noise_scale, dtype=dtype)
-        * leading
-        / jnp.sqrt(jnp.asarray(num_samples, dtype=dtype))
-    )
-
-    if current_eigenvalues.shape[0] > 1:
-        adjacent_scale = jnp.maximum(
-            current_eigenvalues[:-1], eps_array
-        )
-        relative_gaps = (
-            current_eigenvalues[:-1] - current_eigenvalues[1:]
-        ) / adjacent_scale
-        boundaries = (
-            (relative_gaps > jnp.asarray(cluster_gap_threshold, dtype=dtype))
-            & active[:-1]
-            & active[1:]
-        )
-        cluster_ids = jnp.concatenate(
-            [
-                jnp.zeros((1,), dtype=jnp.int32),
-                jnp.cumsum(boundaries.astype(jnp.int32)),
-            ]
-        )
-    else:
-        cluster_ids = jnp.zeros((1,), dtype=jnp.int32)
-    same_cluster = (
-        (cluster_ids[:, None] == cluster_ids[None, :])
-        & active[:, None]
-        & active[None, :]
-    )
-    cluster_members = same_cluster.astype(dtype)
-    cluster_sizes = jnp.maximum(
-        jnp.sum(cluster_members, axis=1), jnp.asarray(1.0, dtype=dtype)
-    )
-
-    eta_target = jnp.asarray(eta_max, dtype=dtype)
-    if mode == "none":
-        eta_by_mode = jnp.zeros_like(current_eigenvalues)
-        averaged_metric = current_metric
-        drift_ratio = jnp.zeros_like(current_eigenvalues)
-    elif mode == "uniform_spectrum":
-        eta_by_mode = (
-            eta_target
-            * active_float
-            * has_usable_history.astype(dtype)
-        )
-        history_eigenvalues = jnp.maximum(jnp.diag(history_metric), 0.0)
-        averaged_eigenvalues = (
-            (1.0 - eta_by_mode) * current_eigenvalues
-            + eta_by_mode * history_eigenvalues
-        )
-        averaged_metric = jnp.diag(averaged_eigenvalues)
-        drift_ratio = jnp.abs(
-            history_eigenvalues - current_eigenvalues
-        ) / jnp.maximum(noise_floor, eps_array)
-    else:
-        # The sample-size-scaled Ritz value is a cheap per-mode SNR proxy.
-        # High-SNR leading modes remain current; noisy tail modes receive more
-        # history.  Cluster averaging avoids basis-dependent decisions inside
-        # nearly degenerate eigenspaces.
-        mode_snr = current_eigenvalues / jnp.maximum(noise_floor, eps_array)
-        base_eta = eta_target / (1.0 + mode_snr)
-        cluster_eta = (
-            cluster_members @ base_eta
-        ) / cluster_sizes
-
-        block_history = jnp.where(same_cluster, history_metric, 0.0)
-        block_difference = block_history - jnp.where(
-            same_cluster, current_metric, 0.0
-        )
-        row_difference_energy = jnp.sum(jnp.square(block_difference), axis=1)
-        cluster_difference_energy = (
-            cluster_members @ row_difference_energy
-        ) / cluster_sizes
-        drift_ratio = jnp.sqrt(jnp.maximum(cluster_difference_energy, 0.0))
-        drift_ratio = drift_ratio / jnp.maximum(noise_floor, eps_array)
-        drift_gate = 1.0 / (
-            1.0
-            + jnp.square(jnp.asarray(drift_scale, dtype=dtype) * drift_ratio)
-        )
-        eta_by_mode = (
-            cluster_eta
-            * drift_gate
-            * active_float
-            * has_usable_history.astype(dtype)
-        )
-        # eta is constant within a cluster. The geometric mean below keeps the
-        # expression symmetric even under roundoff at a cluster boundary.
-        history_weights = jnp.sqrt(
-            eta_by_mode[:, None] * eta_by_mode[None, :]
-        )
-        averaged_metric = jnp.diag(
-            (1.0 - eta_by_mode) * current_eigenvalues
-        ) + jnp.where(
-            same_cluster, history_weights * history_metric, 0.0
-        )
-        averaged_metric = 0.5 * (averaged_metric + averaged_metric.T)
-
-    def _masked_mean(values, mask):
-        mask_float = mask.astype(dtype)
-        return jnp.sum(values * mask_float) / jnp.maximum(
-            jnp.sum(mask_float), jnp.asarray(1.0, dtype=dtype)
-        )
-
-    quartile = jnp.maximum(active_count // 4, 1)
-    indices = jnp.arange(current_eigenvalues.shape[0], dtype=jnp.int32)
-    head_mask = active & (indices < quartile)
-    tail_mask = active & (indices >= jnp.maximum(active_count - quartile, 0))
-    if history_total_mass is None:
-        history_total_mass = jnp.trace(history_metric)
-    history_overlap = jnp.trace(history_metric) / jnp.maximum(
-        jnp.asarray(history_total_mass, dtype=dtype), eps_array
-    )
-    cluster_count = jnp.where(
-        active_count > 0,
-        jnp.max(jnp.where(active, cluster_ids, 0)) + 1,
-        0,
-    )
-    diagnostics = WSSRReducedMetricHistoryDiagnostics(
-        eta_by_mode=eta_by_mode,
-        eta_mean=_masked_mean(eta_by_mode, active),
-        eta_head=_masked_mean(eta_by_mode, head_mask),
-        eta_tail=_masked_mean(eta_by_mode, tail_mask),
-        noise_floor=noise_floor,
-        history_overlap=history_overlap,
-        cluster_count=cluster_count,
-        drift_ratio_mean=_masked_mean(drift_ratio, active),
-    )
-    return averaged_metric, diagnostics
-
-
 def _update_metrics_with_wssr_rank_diagnostics(
     metrics,
     active_rank: Array,
@@ -1865,8 +1511,6 @@ def _wssr_update_from_svd(
     cluster_gap_threshold: chex.Numeric = 0.002,
     near_tail_modes: int = 0,
     adaptive_complement_beta: chex.Numeric = 0.0,
-    adaptive_complement_beta_function: chex.Numeric = 0.0,
-    complement_function_operator: Optional[Array] = None,
     smooth_transition_start: int = -1,
     smooth_transition_end: int = -1,
     iterative_complement_iterations: int = 0,
@@ -1893,10 +1537,11 @@ def _wssr_update_from_svd(
 
     if o_aug is None and force_override is None:
         raise ValueError("blockwise WSSR update requires a precomputed force")
-    if o_aug is None and experimental_mode not in ("none", "adaptive_complement"):
+    if o_aug is None and experimental_mode != "none":
         raise ValueError(
-            "blockwise WSSR update only supports the adaptive complement"
+            "blockwise WSSR update does not support experimental complements"
         )
+
     wssr_experimental.validate_mode(experimental_mode)
     leading_sv = singular_values[0]
     valid_leading = leading_sv > eps
@@ -2032,12 +1677,7 @@ def _wssr_update_from_svd(
         complement = jnp.zeros_like(force)
         if experimental_mode == "adaptive_complement":
             complement, _ = wssr_experimental.adaptive_complement(
-                resolved,
-                perp_force,
-                inv_perp,
-                adaptive_complement_beta,
-                function_operator=complement_function_operator,
-                beta_function=adaptive_complement_beta_function,
+                resolved, perp_force, inv_perp, adaptive_complement_beta
             )
         elif experimental_mode == "residual_optimal_complement":
             regularizer = lambda_reg
@@ -3042,8 +2682,6 @@ def wssr_warm_svd_right_core_update(
     cluster_gap_threshold: chex.Numeric = 0.002,
     near_tail_modes: int = 0,
     adaptive_complement_beta: chex.Numeric = 0.0,
-    adaptive_complement_beta_function: chex.Numeric = 0.0,
-    complement_function_operator: Optional[Array] = None,
     smooth_transition_start: int = -1,
     smooth_transition_end: int = -1,
     force_aware_krylov_vectors: int = 0,
@@ -3122,8 +2760,6 @@ def wssr_warm_svd_right_core_update(
         cluster_gap_threshold=cluster_gap_threshold,
         near_tail_modes=near_tail_modes,
         adaptive_complement_beta=adaptive_complement_beta,
-        adaptive_complement_beta_function=adaptive_complement_beta_function,
-        complement_function_operator=complement_function_operator,
         smooth_transition_start=smooth_transition_start,
         smooth_transition_end=smooth_transition_end,
         iterative_complement_iterations=iterative_complement_iterations,
@@ -3214,9 +2850,6 @@ def wssr_warm_svd_right_core_update_explicit_current_blocks(
     complement_weight: chex.Numeric = 1.0,
     relative_singular_value_cutoff: chex.Numeric = -1.0,
     tikhonov_lambda: chex.Numeric = -1.0,
-    experimental_mode: str = "none",
-    adaptive_complement_beta: chex.Numeric = 0.0,
-    adaptive_complement_beta_function: chex.Numeric = 0.0,
     mixed_precision_solve: bool = False,
     solution_prior: Optional[Array] = None,
     solution_recurrence_mode: str = "none",
@@ -3227,10 +2860,9 @@ def wssr_warm_svd_right_core_update_explicit_current_blocks(
     """Right-warm update using an explicit current block, never ``O_aug``.
 
     This is the memory-bounded counterpart of
-    :func:`wssr_warm_svd_right_core_update`.  In addition to the production
-    Tikhonov/recurrence path, it supports the adaptive complement because that
-    correction needs only the current score block and the already available
-    augmented force.
+    :func:`wssr_warm_svd_right_core_update`. It intentionally supports only the
+    production Tikhonov/recurrence path; experimental complement modes retain
+    the original explicit augmented implementation.
     """
     storage_rank_max = min(sr_rank_max, state.sr_o.shape[1])
     if storage_rank_max == 0:
@@ -3292,10 +2924,6 @@ def wssr_warm_svd_right_core_update_explicit_current_blocks(
         complement_weight=complement_weight,
         relative_singular_value_cutoff=relative_singular_value_cutoff,
         tikhonov_lambda=tikhonov_lambda,
-        experimental_mode=experimental_mode,
-        adaptive_complement_beta=adaptive_complement_beta,
-        adaptive_complement_beta_function=adaptive_complement_beta_function,
-        complement_function_operator=o_cur,
         mixed_precision_solve=mixed_precision_solve,
         mixed_precision_history_width=state.sr_o.shape[1],
         solution_prior=solution_prior,
@@ -3348,7 +2976,6 @@ _jitted_wssr_warm_svd_right_core_update_explicit_current_blocks = jax.jit(
         "constrain_update_norm",
         "spectral_regularization",
         "complement_weight",
-        "experimental_mode",
         "mixed_precision_solve",
         "solution_recurrence_mode",
         "subspace_only_averaging",
@@ -3516,388 +3143,6 @@ _jitted_wssr_warm_svd_right_core_update = jax.jit(
         "fixed_warm_subspace",
     ),
 )
-
-
-def wssr_anisotropic_matrix_history_core_update(
-    o_cur: Array,
-    e_cur: Array,
-    state: WSSRWarmSVDCoreState,
-    key: Array,
-    eta_S: chex.Numeric,
-    damping: chex.Numeric,
-    norm_constraint: chex.Numeric,
-    sr_rank_max: int,
-    sr_scale: chex.Numeric = 1.1,
-    svd_maxiter_initial: int = 8,
-    svd_maxiter_warm: int = 2,
-    exact_first: bool = False,
-    exact_first_force: bool = False,
-    svd_working_rank: Optional[int] = None,
-    constrain_update_norm: bool = False,
-    relative_singular_value_cutoff: chex.Numeric = -1.0,
-    tikhonov_lambda: chex.Numeric = -1.0,
-    noise_scale: chex.Numeric = 1.0,
-) -> WSSRAnisotropicMatrixHistoryResult:
-    """Run legacy augmented-factor WSSR with per-history-mode weights.
-
-    Unlike current-subspace reduced-metric averaging, historical directions
-    remain columns of the SSI operator and can therefore change the computed
-    subspace. Only the shared scalar ``eta_S`` is replaced by spectral-position
-    weights; the RHS remains the current batch force.
-    """
-    history_eigenvalues = jnp.sum(jnp.square(state.sr_o), axis=0)
-    history_active = jnp.arange(state.sr_o.shape[1]) < state.sr_rank0
-    diagnostics = spectral_position_history_weights(
-        history_eigenvalues,
-        history_active,
-        state.sr_rank0 > 0,
-        eta_S,
-        o_cur.shape[1],
-        noise_scale=noise_scale,
-    )
-    o_aug = augment_wssr_anisotropic_matrix_history(
-        o_cur, state, diagnostics
-    )
-    # Gradient averaging is intentionally absent. e_aug is unused by the solve
-    # because force_override supplies O_current @ epsilon_current, and it is
-    # also omitted from the next state by the standard force-override path.
-    e_aug = jnp.zeros((o_aug.shape[1],), dtype=o_cur.dtype)
-    current_force = o_cur @ e_cur
-    result = _jitted_wssr_warm_svd_right_core_update(
-        o_aug,
-        e_aug,
-        state,
-        key,
-        damping,
-        norm_constraint,
-        sr_rank_max,
-        sr_scale=sr_scale,
-        svd_maxiter_initial=svd_maxiter_initial,
-        svd_maxiter_warm=svd_maxiter_warm,
-        exact_first=exact_first,
-        exact_first_force=exact_first_force,
-        svd_working_rank=svd_working_rank,
-        constrain_update_norm=constrain_update_norm,
-        spectral_regularization="tikhonov",
-        complement_weight=0.0,
-        relative_singular_value_cutoff=relative_singular_value_cutoff,
-        tikhonov_lambda=tikhonov_lambda,
-        force_override=current_force,
-    )
-    return WSSRAnisotropicMatrixHistoryResult(
-        result.grad_like_update,
-        result.state,
-        result.active_rank,
-        diagnostics,
-    )
-
-
-def compute_wssr_anisotropic_matrix_history_update(
-    log_psi_apply: ModelApply[P],
-    params: P,
-    positions: Array,
-    local_energies: Array,
-    energy: Array,
-    state: WSSRWarmSVDCoreState,
-    key: Array,
-    eta_S: chex.Numeric,
-    damping: chex.Numeric,
-    norm_constraint: chex.Numeric,
-    sr_rank_max: int,
-    sr_scale: chex.Numeric = 1.1,
-    svd_maxiter_initial: int = 8,
-    svd_maxiter_warm: int = 2,
-    exact_first: bool = False,
-    exact_first_force: bool = False,
-    svd_working_rank: Optional[int] = None,
-    constrain_update_norm: bool = False,
-    relative_singular_value_cutoff: chex.Numeric = -1.0,
-    tikhonov_lambda: chex.Numeric = -1.0,
-    noise_scale: chex.Numeric = 1.0,
-):
-    """Build current scores, apply anisotropic matrix history, and unflatten."""
-    o_cur, unravel_fn = center_and_scale_score_matrix(
-        log_psi_apply, params, positions
-    )
-    e_cur = center_and_scale_energy_residuals(local_energies, energy)
-    result = wssr_anisotropic_matrix_history_core_update(
-        o_cur,
-        e_cur,
-        state,
-        key,
-        eta_S,
-        damping,
-        norm_constraint,
-        sr_rank_max,
-        sr_scale=sr_scale,
-        svd_maxiter_initial=svd_maxiter_initial,
-        svd_maxiter_warm=svd_maxiter_warm,
-        exact_first=exact_first,
-        exact_first_force=exact_first_force,
-        svd_working_rank=svd_working_rank,
-        constrain_update_norm=constrain_update_norm,
-        relative_singular_value_cutoff=relative_singular_value_cutoff,
-        tikhonov_lambda=tikhonov_lambda,
-        noise_scale=noise_scale,
-    )
-    current_gradient = o_cur @ e_cur
-    return (
-        unravel_fn(result.grad_like_update),
-        result.state,
-        result.active_rank,
-        jnp.linalg.norm(current_gradient),
-        result.diagnostics,
-    )
-
-
-def wssr_current_subspace_reduced_metric_core_update(
-    o_cur: Array,
-    e_cur: Array,
-    state: WSSRWarmSVDCoreState,
-    key: Array,
-    eta_S: chex.Numeric,
-    damping: chex.Numeric,
-    norm_constraint: chex.Numeric,
-    sr_rank_max: int,
-    history_mode: str,
-    sr_scale: chex.Numeric = 1.1,
-    svd_maxiter_initial: int = 8,
-    svd_maxiter_warm: int = 2,
-    exact_first: bool = False,
-    exact_first_force: bool = False,
-    svd_working_rank: Optional[int] = None,
-    constrain_update_norm: bool = False,
-    relative_singular_value_cutoff: chex.Numeric = -1.0,
-    tikhonov_lambda: chex.Numeric = -1.0,
-    cluster_gap_threshold: chex.Numeric = 0.01,
-    noise_scale: chex.Numeric = 1.0,
-    drift_scale: chex.Numeric = 1.0,
-    eps: chex.Numeric = 1e-12,
-) -> WSSRReducedMetricHistoryResult:
-    """Solve with a current-batch subspace and historical reduced metric.
-
-    In the code convention ``o_cur`` is ``O_bar.T`` with shape
-    ``(num_params, num_samples)``.  SSI is applied to ``o_cur`` alone.  The
-    previous factor stored in ``state.sr_o`` is projected into that new basis,
-    and only the resulting rank-by-rank metric is averaged.  The force is
-    always the current ``o_cur @ e_cur``; there is no gradient EMA.
-    """
-    if history_mode not in _WSSR_REDUCED_METRIC_HISTORY_MODES:
-        raise ValueError(
-            "history_mode must be one of "
-            f"{_WSSR_REDUCED_METRIC_HISTORY_MODES}"
-        )
-    storage_rank_max = min(sr_rank_max, state.sr_o.shape[1])
-    working_rank_max = min(
-        _resolve_svd_working_rank(svd_working_rank, sr_rank_max),
-        storage_rank_max,
-        o_cur.shape[0],
-        o_cur.shape[1],
-    )
-    if working_rank_max == 0:
-        zero_state = _zero_warm_svd_history_like(state)
-        zero_diag = WSSRReducedMetricHistoryDiagnostics(
-            eta_by_mode=jnp.zeros((0,), dtype=o_cur.dtype),
-            eta_mean=jnp.asarray(0.0, dtype=o_cur.dtype),
-            eta_head=jnp.asarray(0.0, dtype=o_cur.dtype),
-            eta_tail=jnp.asarray(0.0, dtype=o_cur.dtype),
-            noise_floor=jnp.asarray(0.0, dtype=o_cur.dtype),
-            history_overlap=jnp.asarray(0.0, dtype=o_cur.dtype),
-            cluster_count=jnp.asarray(0, dtype=jnp.int32),
-            drift_ratio_mean=jnp.asarray(0.0, dtype=o_cur.dtype),
-        )
-        return WSSRReducedMetricHistoryResult(
-            jnp.zeros(o_cur.shape[0], dtype=o_cur.dtype),
-            zero_state,
-            jnp.asarray(0, dtype=state.sr_rank.dtype),
-            zero_diag,
-        )
-
-    # The decomposition sees only the current batch. ``state.u`` is merely an
-    # iterative initial guess and therefore does not change the operator whose
-    # Ritz subspace is computed.
-    u, singular_values, _, rank = _wssr_right_svd_decomposition(
-        o_cur,
-        state,
-        key,
-        working_rank_max,
-        svd_maxiter_initial,
-        svd_maxiter_warm,
-        exact_first,
-        eps,
-        exact_first_force=exact_first_force,
-    )
-    leading_sv = singular_values[0]
-    valid_leading = leading_sv > eps
-    safe_leading_sv = jnp.where(valid_leading, leading_sv, 1.0)
-    relative_cutoff, lambda_reg = _wssr_resolve_spectral_controls(
-        safe_leading_sv,
-        damping,
-        relative_singular_value_cutoff,
-        tikhonov_lambda,
-        eps,
-    )
-    retained = (
-        (jnp.arange(working_rank_max) < rank)
-        & (singular_values / safe_leading_sv > relative_cutoff)
-        & valid_leading
-    )
-    active_rank = jnp.sum(retained.astype(state.sr_rank.dtype))
-    valid_update = valid_leading & (active_rank > 0)
-    current_eigenvalues = jnp.where(
-        retained, jnp.square(singular_values), 0.0
-    )
-
-    history_mask = (
-        jnp.arange(state.sr_o.shape[1]) < state.sr_rank0
-    ).astype(o_cur.dtype)
-    history_factor = state.sr_o * history_mask[None, :]
-    history_projection = history_factor.T @ u
-    history_metric = history_projection.T @ history_projection
-    averaged_metric, diagnostics = average_current_reduced_metric(
-        current_eigenvalues,
-        history_metric,
-        retained,
-        state.sr_rank0 > 0,
-        history_mode,
-        eta_S,
-        o_cur.shape[1],
-        cluster_gap_threshold=cluster_gap_threshold,
-        noise_scale=noise_scale,
-        drift_scale=drift_scale,
-        history_total_mass=jnp.sum(jnp.square(history_factor)),
-        eps=eps,
-    )
-
-    # The diagonal spectrum-only arm needs no second decomposition.  Adaptive
-    # spectral clusters can contain dense invariant blocks; there one reduced
-    # eigendecomposition both solves those blocks and produces a factor F_t
-    # with F_t F_t.T equal to the averaged metric. No dense parameter-space
-    # Fisher matrix is ever formed.
-    if history_mode == "cluster_adaptive":
-        reduced_eigenvalues, reduced_rotation = jnp.linalg.eigh(
-            0.5 * (averaged_metric + averaged_metric.T)
-        )
-        order = jnp.argsort(reduced_eigenvalues)[::-1]
-        reduced_eigenvalues = jnp.maximum(reduced_eigenvalues[order], 0.0)
-        reduced_rotation = reduced_rotation[:, order]
-    else:
-        reduced_eigenvalues = jnp.maximum(jnp.diag(averaged_metric), 0.0)
-        reduced_rotation = jnp.eye(working_rank_max, dtype=o_cur.dtype)
-    force = o_cur @ e_cur
-    reduced_force = reduced_rotation.T @ (u.T @ force)
-    solved_coefficients = reduced_force / (
-        reduced_eigenvalues + lambda_reg
-    )
-    direction = u @ (reduced_rotation @ solved_coefficients)
-    direction = jnp.where(valid_update, direction, jnp.zeros_like(direction))
-    if constrain_update_norm:
-        direction = constrain_norm(direction, norm_constraint, eps=eps)
-
-    metric_basis = u @ reduced_rotation
-    factor_mask = (
-        jnp.arange(working_rank_max) < active_rank
-    ).astype(o_cur.dtype)
-    factor_values = (
-        metric_basis
-        * jnp.sqrt(reduced_eigenvalues)[None, :]
-        * factor_mask[None, :]
-    )
-    next_sr_o = jnp.zeros_like(state.sr_o)
-    next_sr_o = next_sr_o.at[:, :working_rank_max].set(factor_values)
-    next_u = jnp.zeros_like(state.u)
-    warm_width = min(working_rank_max, state.u.shape[1])
-    next_u = next_u.at[:, :warm_width].set(
-        u[:, :warm_width]
-        * retained[:warm_width].astype(o_cur.dtype)[None, :]
-    )
-    updated_rank = _update_working_rank(
-        active_rank, state.sr_rank, working_rank_max, sr_scale
-    )
-    capped_rank = jnp.minimum(
-        state.sr_rank,
-        jnp.asarray(working_rank_max, dtype=state.sr_rank.dtype),
-    )
-    next_state = WSSRWarmSVDCoreState(
-        sr_o=jnp.where(valid_update, next_sr_o, jnp.zeros_like(next_sr_o)),
-        # Gradient history is deliberately absent: RHS = current batch force.
-        ek=jnp.zeros_like(state.ek),
-        sr_rank0=jnp.where(
-            valid_update,
-            active_rank,
-            jnp.asarray(0, dtype=state.sr_rank0.dtype),
-        ),
-        sr_rank=jnp.where(valid_update, updated_rank, capped_rank),
-        u=jnp.where(valid_update, next_u, state.u),
-        has_u=jnp.where(valid_update, jnp.asarray(True), state.has_u),
-    )
-    return WSSRReducedMetricHistoryResult(
-        direction, next_state, active_rank, diagnostics
-    )
-
-
-def compute_wssr_current_subspace_reduced_metric_update(
-    log_psi_apply: ModelApply[P],
-    params: P,
-    positions: Array,
-    local_energies: Array,
-    energy: Array,
-    state: WSSRWarmSVDCoreState,
-    key: Array,
-    eta_S: chex.Numeric,
-    damping: chex.Numeric,
-    norm_constraint: chex.Numeric,
-    sr_rank_max: int,
-    history_mode: str,
-    sr_scale: chex.Numeric = 1.1,
-    svd_maxiter_initial: int = 8,
-    svd_maxiter_warm: int = 2,
-    exact_first: bool = False,
-    exact_first_force: bool = False,
-    svd_working_rank: Optional[int] = None,
-    constrain_update_norm: bool = False,
-    relative_singular_value_cutoff: chex.Numeric = -1.0,
-    tikhonov_lambda: chex.Numeric = -1.0,
-    cluster_gap_threshold: chex.Numeric = 0.01,
-    noise_scale: chex.Numeric = 1.0,
-    drift_scale: chex.Numeric = 1.0,
-):
-    """Build current scores, apply reduced-metric history, and unflatten."""
-    o_cur, unravel_fn = center_and_scale_score_matrix(
-        log_psi_apply, params, positions
-    )
-    e_cur = center_and_scale_energy_residuals(local_energies, energy)
-    result = wssr_current_subspace_reduced_metric_core_update(
-        o_cur,
-        e_cur,
-        state,
-        key,
-        eta_S,
-        damping,
-        norm_constraint,
-        sr_rank_max,
-        history_mode,
-        sr_scale=sr_scale,
-        svd_maxiter_initial=svd_maxiter_initial,
-        svd_maxiter_warm=svd_maxiter_warm,
-        exact_first=exact_first,
-        exact_first_force=exact_first_force,
-        svd_working_rank=svd_working_rank,
-        constrain_update_norm=constrain_update_norm,
-        relative_singular_value_cutoff=relative_singular_value_cutoff,
-        tikhonov_lambda=tikhonov_lambda,
-        cluster_gap_threshold=cluster_gap_threshold,
-        noise_scale=noise_scale,
-        drift_scale=drift_scale,
-    )
-    current_gradient = o_cur @ e_cur
-    return (
-        unravel_fn(result.grad_like_update),
-        result.state,
-        result.active_rank,
-        jnp.linalg.norm(current_gradient),
-        result.diagnostics,
-    )
 
 
 def wssr_warm_svd_right_reference_diagnostic_core_update(
@@ -4252,7 +3497,6 @@ def compute_wssr_warm_svd_right_core_update(
     cluster_gap_threshold: chex.Numeric = 0.002,
     near_tail_modes: int = 0,
     adaptive_complement_beta: chex.Numeric = 0.0,
-    adaptive_complement_beta_function: chex.Numeric = 0.0,
     smooth_transition_start: int = -1,
     smooth_transition_end: int = -1,
     force_aware_krylov_vectors: int = 0,
@@ -4317,11 +3561,6 @@ def compute_wssr_warm_svd_right_core_update(
                     relative_singular_value_cutoff
                 ),
                 tikhonov_lambda=tikhonov_lambda,
-                experimental_mode=experimental_mode,
-                adaptive_complement_beta=adaptive_complement_beta,
-                adaptive_complement_beta_function=(
-                    adaptive_complement_beta_function
-                ),
                 mixed_precision_solve=mixed_precision_solve,
                 solution_prior=solution_prior,
                 solution_recurrence_mode=solution_recurrence_mode,
@@ -4365,10 +3604,6 @@ def compute_wssr_warm_svd_right_core_update(
             cluster_gap_threshold=cluster_gap_threshold,
             near_tail_modes=near_tail_modes,
             adaptive_complement_beta=adaptive_complement_beta,
-            adaptive_complement_beta_function=(
-                adaptive_complement_beta_function
-            ),
-            complement_function_operator=o_cur,
             smooth_transition_start=smooth_transition_start,
             smooth_transition_end=smooth_transition_end,
             force_aware_krylov_vectors=force_aware_krylov_vectors,
@@ -4644,8 +3879,6 @@ def compute_wssr_cluster_envelope_update(
     curvature_mode="scalar",
     enable_cross_batch_snr_shrinkage=False,
     snr_cluster_gap_threshold=0.05,
-    enable_grassmann_smoothing=False,
-    grassmann_smoothing_alpha=0.5,
     error_feedback_state=None,
     enable_rotation_error_feedback=False,
     rotation_error_feedback_decay=0.95,
@@ -4703,7 +3936,6 @@ def compute_wssr_cluster_envelope_update(
     )
 
     history_blocks = max(envelope_length - 1, 0)
-    grassmann_overlap_singular_values = jnp.ones((k,), dtype=u.dtype)
     if history_blocks > 0:
         block_ids = jnp.repeat(jnp.arange(history_blocks), k)
         history_mask = (block_ids < envelope_count).astype(u.dtype)
@@ -4757,30 +3989,6 @@ def compute_wssr_cluster_envelope_update(
         history_selection_gain = jnp.asarray(0.0, dtype=u.dtype)
         envelope_basis = current_basis
 
-    if enable_grassmann_smoothing:
-        if history_blocks != 1:
-            raise ValueError(
-                "grassmann_ritz requires cluster_envelope_history=2"
-            )
-        previous_basis = envelope_history[:, :k]
-
-        def _smooth(_):
-            return wssr_experimental.procrustes_grassmann_average(
-                previous_basis,
-                current_basis,
-                grassmann_smoothing_alpha,
-            )
-
-        def _current(_):
-            return current_basis, jnp.ones((k,), dtype=u.dtype)
-
-        envelope_basis, grassmann_overlap_singular_values = jax.lax.cond(
-            envelope_count > 0,
-            _smooth,
-            _current,
-            operand=None,
-        )
-
     orthonormal_envelope, numerical_rank, gram_eigenvalues = (
         wssr_experimental.orthonormalize_basis_envelope(
             envelope_basis,
@@ -4807,18 +4015,7 @@ def compute_wssr_cluster_envelope_update(
         orthonormal_envelope.T @ effective_gradient
     )
 
-    if enable_grassmann_smoothing:
-        history_numerical_rank = jnp.sum(
-            grassmann_overlap_singular_values > envelope_eigenvalue_cutoff
-        ).astype(jnp.int32)
-        novelty_fraction = jnp.clip(
-            1.0
-            - jnp.sum(jnp.square(grassmann_overlap_singular_values))
-            / jnp.maximum(jnp.asarray(k, dtype=u.dtype), 1.0),
-            0.0,
-            1.0,
-        )
-    elif history_blocks > 0:
+    if history_blocks > 0:
         projected_current, history_numerical_rank, _ = (
             wssr_experimental.project_onto_basis_envelope(
                 weighted_history,
@@ -5012,13 +4209,7 @@ def compute_wssr_cluster_envelope_update(
         jnp.where(rank > 0, jnp.array(True), state.has_u),
     )
 
-    if enable_grassmann_smoothing:
-        next_history = jnp.zeros_like(envelope_history)
-        next_history = next_history.at[:, :k].set(
-            orthonormal_envelope[:, :k]
-        )
-        next_count = jnp.asarray(1, dtype=envelope_count.dtype)
-    elif history_blocks > 0:
+    if history_blocks > 0:
         retained_history = envelope_history[:, : max(history_blocks - 1, 0) * k]
         next_history = jnp.concatenate(
             [current_basis, retained_history], axis=1
@@ -5097,18 +4288,6 @@ def compute_wssr_cluster_envelope_update(
             singular_values.shape[0] > k, dtype=jnp.int32
         ),
         "wssr_envelope_current_novelty_fraction": novelty_fraction,
-        "wssr_grassmann_alpha": jnp.asarray(
-            grassmann_smoothing_alpha, dtype=u.dtype
-        ),
-        "wssr_grassmann_history_active": (
-            (envelope_count > 0) & enable_grassmann_smoothing
-        ).astype(jnp.int32),
-        "wssr_grassmann_overlap_mean": jnp.mean(
-            grassmann_overlap_singular_values
-        ),
-        "wssr_grassmann_overlap_min": jnp.min(
-            grassmann_overlap_singular_values
-        ),
         "wssr_envelope_gradient_capture_fraction": (
             cluster_gradient_norm / jnp.maximum(gradient_norm, eps)
         ),
@@ -5199,10 +4378,7 @@ def compute_wssr_warm_svd_right_experimental_diagnostic_update(
       tikhonov_lambda=kwargs.get('tikhonov_lambda',-1.0),
       experimental_target_rank=kwargs.get('experimental_target_rank',-1),
       cluster_gap_threshold=kwargs.get('cluster_gap_threshold',.002),near_tail_modes=kwargs.get('near_tail_modes',0),
-      adaptive_complement_beta=kwargs.get('adaptive_complement_beta',0.),
-      adaptive_complement_beta_function=kwargs.get('adaptive_complement_beta_function',0.),
-      complement_function_operator=o_cur,
-      smooth_transition_start=kwargs.get('smooth_transition_start',-1),
+      adaptive_complement_beta=kwargs.get('adaptive_complement_beta',0.),smooth_transition_start=kwargs.get('smooth_transition_start',-1),
       smooth_transition_end=kwargs.get('smooth_transition_end',-1),iterative_complement_iterations=kwargs.get('iterative_complement_iterations',0))
     base=_wssr_update_from_svd(o_aug,e_aug,state,u,s,vh,damping,norm_constraint,state.sr_o.shape[1],**post)
     resolved=base.grad_like_update
@@ -5356,16 +4532,10 @@ def compute_wssr_warm_svd_right_experimental_diagnostic_update(
         projected=u.T@(o_aug@e_aug)
         retained=(s/leading>relative_cutoff).astype(u.dtype)
         perp_force=(o_aug@e_aug)-u@(projected*retained)
-        _, adaptive_alpha = wssr_experimental.adaptive_complement(
-            resolved,
-            perp_force,
+        adaptive_alpha=jnp.minimum(
             alpha_nominal,
-            adaptive_requested_beta,
-            function_operator=o_cur,
-            beta_function=kwargs.get(
-                'adaptive_complement_beta_function', 0.0
-            ),
-        )
+            adaptive_requested_beta*jnp.linalg.norm(resolved)
+            /jnp.maximum(jnp.linalg.norm(perp_force),1e-30))
         adaptive_unclamped_norm=alpha_nominal*jnp.linalg.norm(perp_force)
         adaptive_cap_active=(adaptive_alpha<alpha_nominal).astype(jnp.int32)
     elif mode=='residual_optimal_complement':
@@ -5902,39 +5072,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
     record_param_l1_norm: bool = False,
 ) -> UpdateParamFn[P, D, WSSROptimizerState]:
     """Create the integrated right-subspace warm-start SVD WSSR update function."""
-    norm_constraint_mode = optimizer_config.get(
-        "norm_constraint_mode", "euclidean"
-    )
-    if norm_constraint_mode not in ("euclidean", "function_space"):
-        raise ValueError(
-            "WSSR norm_constraint_mode must be euclidean or function_space"
-        )
-    function_norm_constraint = optimizer_config.get(
-        "function_norm_constraint", 0.001
-    )
-    if function_norm_constraint <= 0.0:
-        raise ValueError("function_norm_constraint must be positive")
-    euclidean_safety_constraint = optimizer_config.get(
-        "euclidean_safety_constraint", -1.0
-    )
-    if euclidean_safety_constraint == 0.0:
-        raise ValueError(
-            "euclidean_safety_constraint must be positive or negative to disable"
-        )
-    adaptive_complement_beta_function = optimizer_config.get(
-        "adaptive_complement_beta_function", 0.0
-    )
-    if adaptive_complement_beta_function < 0.0:
-        raise ValueError("adaptive_complement_beta_function must be nonnegative")
-    if (
-        adaptive_complement_beta_function > 0.0
-        and optimizer_config.get("experimental_mode", "none")
-        != "adaptive_complement"
-    ):
-        raise ValueError(
-            "function-space complement cap requires adaptive_complement mode"
-        )
-
     _validate_wssr_spectral_regularization(
         optimizer_config.get("spectral_regularization", "hard_floor"),
         optimizer_config.get("complement_weight", 1.0),
@@ -5985,111 +5122,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
     eta_S_config, eta_g_config = resolve_wssr_averaging_weights(
         optimizer_config
     )
-    reduced_metric_history_mode = optimizer_config.get(
-        "reduced_metric_history_mode", "none"
-    )
-    if reduced_metric_history_mode not in _WSSR_REDUCED_METRIC_HISTORY_MODES:
-        raise ValueError(
-            "reduced_metric_history_mode must be one of "
-            f"{_WSSR_REDUCED_METRIC_HISTORY_MODES}"
-        )
-    use_reduced_metric_history = reduced_metric_history_mode != "none"
-    if use_reduced_metric_history:
-        if eta_g_config != 0.0:
-            raise ValueError(
-                "reduced metric history requires eta_g=0 (current RHS)"
-            )
-        if adaptive_S_average or adaptive_g_average or enable_gradient_transport:
-            raise ValueError(
-                "reduced metric history owns its spectral adaptation and cannot "
-                "be combined with averaging schedules or gradient transport"
-            )
-        if optimizer_config.get("experimental_mode", "none") != "none":
-            raise ValueError(
-                "reduced metric history cannot be combined with experimental_mode"
-            )
-        if optimizer_config.get("spectral_regularization") != "tikhonov":
-            raise ValueError(
-                "reduced metric history requires Tikhonov regularization"
-            )
-        if optimizer_config.get("complement_weight", 1.0) != 0.0:
-            raise ValueError(
-                "reduced metric history requires complement_weight=0"
-            )
-        if optimizer_config.get("tikhonov_lambda", -1.0) < 0.0:
-            raise ValueError(
-                "reduced metric history requires an explicit tikhonov_lambda"
-            )
-        if not optimizer_config.get("store_warm_u", True):
-            raise ValueError(
-                "reduced metric history requires store_warm_u=True"
-            )
-        if optimizer_config.get("semi_matrix_free_augmented", False):
-            raise ValueError(
-                "reduced metric history uses a current-only score block and "
-                "cannot be combined with semi_matrix_free_augmented"
-            )
-        if optimizer_config.get("spectral_history_cluster_gap", 0.01) < 0.0:
-            raise ValueError("spectral_history_cluster_gap must be nonnegative")
-        if optimizer_config.get("spectral_history_noise_scale", 1.0) <= 0.0:
-            raise ValueError("spectral_history_noise_scale must be positive")
-        if optimizer_config.get("spectral_history_drift_scale", 1.0) < 0.0:
-            raise ValueError(
-                "spectral_history_drift_scale must be nonnegative"
-            )
-    use_anisotropic_matrix_history = optimizer_config.get(
-        "anisotropic_matrix_history", False
-    )
-    if use_anisotropic_matrix_history:
-        if use_reduced_metric_history:
-            raise ValueError(
-                "anisotropic matrix history and reduced metric history are "
-                "mutually exclusive"
-            )
-        if not 0.0 <= eta_S_config < 1.0:
-            raise ValueError(
-                "anisotropic matrix history requires eta_S in [0, 1)"
-            )
-        if eta_g_config != 0.0:
-            raise ValueError(
-                "anisotropic matrix history requires eta_g=0 (current RHS)"
-            )
-        if adaptive_S_average or adaptive_g_average or enable_gradient_transport:
-            raise ValueError(
-                "anisotropic matrix history cannot be combined with averaging "
-                "schedules or gradient transport"
-            )
-        if optimizer_config.get("experimental_mode", "none") != "none":
-            raise ValueError(
-                "anisotropic matrix history cannot be combined with experimental_mode"
-            )
-        if optimizer_config.get("spectral_regularization") != "tikhonov":
-            raise ValueError(
-                "anisotropic matrix history requires Tikhonov regularization"
-            )
-        if optimizer_config.get("complement_weight", 1.0) != 0.0:
-            raise ValueError(
-                "anisotropic matrix history requires complement_weight=0"
-            )
-        if optimizer_config.get("tikhonov_lambda", -1.0) < 0.0:
-            raise ValueError(
-                "anisotropic matrix history requires an explicit tikhonov_lambda"
-            )
-        if not optimizer_config.get("store_warm_u", True):
-            raise ValueError(
-                "anisotropic matrix history requires store_warm_u=True"
-            )
-        if optimizer_config.get("semi_matrix_free_augmented", False):
-            raise ValueError(
-                "anisotropic matrix history cannot be combined with "
-                "semi_matrix_free_augmented"
-            )
-        if optimizer_config.get(
-            "anisotropic_matrix_history_noise_scale", 1.0
-        ) <= 0.0:
-            raise ValueError(
-                "anisotropic_matrix_history_noise_scale must be positive"
-            )
     experimental_mode = optimizer_config.get("experimental_mode", "none")
     use_cluster_envelope = experimental_mode in (
         "cluster_envelope",
@@ -6097,7 +5129,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
         "cluster_envelope_ritz_ef",
         "cluster_envelope_ritz_selected",
         "cluster_envelope_ritz_snr",
-        "grassmann_ritz",
     )
     use_cluster_envelope_ef = experimental_mode == "cluster_envelope_ritz_ef"
     use_cluster_envelope_selection = (
@@ -6114,14 +5145,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
             )
         if envelope_length < 1:
             raise ValueError("cluster_envelope_history must be positive")
-        if experimental_mode == "grassmann_ritz" and envelope_length != 2:
-            raise ValueError(
-                "grassmann_ritz requires cluster_envelope_history=2"
-            )
-        if not 0.0 <= optimizer_config.get(
-            "grassmann_smoothing_alpha", 0.5
-        ) <= 1.0:
-            raise ValueError("grassmann_smoothing_alpha must be in [0, 1]")
         if optimizer_config.get("cluster_snr_gap_threshold", 0.05) < 0.0:
             raise ValueError("cluster_snr_gap_threshold must be nonnegative")
         envelope_capacity = optimizer_config.get(
@@ -6172,8 +5195,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
         or adaptive_g_average
         or enable_gradient_transport
         or eta_S_config != eta_g_config
-    ) and not (
-        use_reduced_metric_history or use_anisotropic_matrix_history
     )
     if use_independent_gradient_memory:
         if optimizer_config.get("experimental_mode", "none") != "none":
@@ -6221,19 +5242,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
     solution_recurrence_mode = optimizer_config.get(
         "solution_recurrence_mode", "none"
     )
-    if use_reduced_metric_history or use_anisotropic_matrix_history:
-        if solution_recurrence_mode != "none":
-            raise ValueError(
-                "spectral history modes cannot be combined with solution recurrence"
-            )
-        if (
-            optimizer_config.get("exact_reference_diagnostics", False)
-            or optimizer_config.get("update_diagnostics", False)
-            or optimizer_config.get("reliability_diagnostics", False)
-        ):
-            raise ValueError(
-                "spectral history modes cannot be combined with reference diagnostics"
-            )
     residual_evaluation = optimizer_config.get(
         "residual_evaluation", "rank_coordinate"
     )
@@ -6355,13 +5363,9 @@ def construct_wssr_warm_svd_right_update_param_fn(
             raise ValueError(
                 "semi_matrix_free_augmented does not support exact_first"
             )
-        if optimizer_config.get("experimental_mode", "none") not in (
-            "none",
-            "adaptive_complement",
-        ):
+        if optimizer_config.get("experimental_mode", "none") != "none":
             raise ValueError(
-                "semi_matrix_free_augmented supports only the "
-                "adaptive_complement experimental mode"
+                "semi_matrix_free_augmented does not support experimental modes"
             )
         if use_independent_gradient_memory:
             raise ValueError(
@@ -6583,9 +5587,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
             cluster_gap_threshold=optimizer_config.get("cluster_gap_threshold", 0.002),
             near_tail_modes=optimizer_config.get("near_tail_modes", 0),
             adaptive_complement_beta=adaptive_beta,
-            adaptive_complement_beta_function=(
-                adaptive_complement_beta_function
-            ),
             smooth_transition_start=optimizer_config.get("smooth_transition_start", -1),
             smooth_transition_end=optimizer_config.get("smooth_transition_end", -1),
             force_aware_krylov_vectors=optimizer_config.get("force_aware_krylov_vectors", 0),
@@ -6596,116 +5597,13 @@ def construct_wssr_warm_svd_right_update_param_fn(
             and (optimizer_config.get("exact_reference_diagnostics", False)
                  or optimizer_config.get("update_diagnostics", False))
         )
-        inline_semimf_adaptive_complement = (
-            semi_matrix_free_augmented
-            and optimizer_config.get("experimental_mode", "none")
-            == "adaptive_complement"
-            and not optimizer_config.get("reliability_diagnostics", False)
-        )
         use_experimental_path = (
             optimizer_config.get("experimental_mode", "none") != "none"
             or optimizer_config.get("reliability_diagnostics", False)
-        ) and not inline_semimf_adaptive_complement
+        )
         gradient_metrics_available = False
         recurrence_diagnostics = None
-        reduced_metric_diagnostics = None
-        anisotropic_matrix_diagnostics = None
-        if use_anisotropic_matrix_history:
-            (
-                grad_like_update,
-                core_state,
-                active_rank,
-                gradient_norm,
-                anisotropic_matrix_diagnostics,
-            ) = compute_wssr_anisotropic_matrix_history_update(
-                log_psi_apply,
-                params,
-                position,
-                local_energies,
-                energy,
-                optimizer_state.core_state,
-                svd_key,
-                eta_S_used,
-                optimizer_config.damping,
-                optimizer_config.norm_constraint,
-                optimizer_config.sr_rank_max,
-                sr_scale=optimizer_config.sr_scale,
-                svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
-                svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
-                exact_first=optimizer_config.get("exact_first", False),
-                exact_first_force=optimizer_config.get(
-                    "exact_first_force", False
-                ),
-                svd_working_rank=optimizer_config.get(
-                    "svd_working_rank", None
-                ),
-                constrain_update_norm=False,
-                relative_singular_value_cutoff=optimizer_config.get(
-                    "relative_singular_value_cutoff", -1.0
-                ),
-                tikhonov_lambda=optimizer_config.get(
-                    "tikhonov_lambda", -1.0
-                ),
-                noise_scale=optimizer_config.get(
-                    "anisotropic_matrix_history_noise_scale", 1.0
-                ),
-            )
-            gradient_history_norm = gradient_norm
-            gradient_metrics_available = True
-            reference_metrics = {}
-            complement_state = None
-        elif use_reduced_metric_history:
-            (
-                grad_like_update,
-                core_state,
-                active_rank,
-                gradient_norm,
-                reduced_metric_diagnostics,
-            ) = compute_wssr_current_subspace_reduced_metric_update(
-                log_psi_apply,
-                params,
-                position,
-                local_energies,
-                energy,
-                optimizer_state.core_state,
-                svd_key,
-                eta_S_used,
-                optimizer_config.damping,
-                optimizer_config.norm_constraint,
-                optimizer_config.sr_rank_max,
-                reduced_metric_history_mode,
-                sr_scale=optimizer_config.sr_scale,
-                svd_maxiter_initial=optimizer_config.svd_maxiter_initial,
-                svd_maxiter_warm=optimizer_config.svd_maxiter_warm,
-                exact_first=optimizer_config.get("exact_first", False),
-                exact_first_force=optimizer_config.get(
-                    "exact_first_force", False
-                ),
-                svd_working_rank=optimizer_config.get(
-                    "svd_working_rank", None
-                ),
-                constrain_update_norm=False,
-                relative_singular_value_cutoff=optimizer_config.get(
-                    "relative_singular_value_cutoff", -1.0
-                ),
-                tikhonov_lambda=optimizer_config.get(
-                    "tikhonov_lambda", -1.0
-                ),
-                cluster_gap_threshold=optimizer_config.get(
-                    "spectral_history_cluster_gap", 0.01
-                ),
-                noise_scale=optimizer_config.get(
-                    "spectral_history_noise_scale", 1.0
-                ),
-                drift_scale=optimizer_config.get(
-                    "spectral_history_drift_scale", 1.0
-                ),
-            )
-            gradient_history_norm = gradient_norm
-            gradient_metrics_available = True
-            reference_metrics = {}
-            complement_state = None
-        elif use_independent_gradient_memory:
+        if use_independent_gradient_memory:
             transport_core_kwargs = {
                 name: value
                 for name, value in core_kwargs.items()
@@ -6716,7 +5614,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                     "cluster_gap_threshold",
                     "near_tail_modes",
                     "adaptive_complement_beta",
-                    "adaptive_complement_beta_function",
                     "smooth_transition_start",
                     "smooth_transition_end",
                     "force_aware_krylov_vectors",
@@ -6788,7 +5685,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                         "cluster_envelope_ritz_ef",
                         "cluster_envelope_ritz_selected",
                         "cluster_envelope_ritz_snr",
-                        "grassmann_ritz",
                     )
                     else optimizer_config.get("cluster_envelope_alpha", 0.2)
                 ),
@@ -6805,7 +5701,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                         "cluster_envelope_ritz_ef",
                         "cluster_envelope_ritz_selected",
                         "cluster_envelope_ritz_snr",
-                        "grassmann_ritz",
                     )
                     else optimizer_config.get(
                         "cluster_envelope_curvature_mode", "scalar"
@@ -6813,12 +5708,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                 ),
                 enable_cross_batch_snr_shrinkage=(
                     experimental_mode == "cluster_envelope_ritz_snr"
-                ),
-                enable_grassmann_smoothing=(
-                    experimental_mode == "grassmann_ritz"
-                ),
-                grassmann_smoothing_alpha=optimizer_config.get(
-                    "grassmann_smoothing_alpha", 0.5
                 ),
                 snr_cluster_gap_threshold=optimizer_config.get(
                     "cluster_snr_gap_threshold", 0.05
@@ -6911,7 +5800,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                     "cluster_gap_threshold",
                     "near_tail_modes",
                     "adaptive_complement_beta",
-                    "adaptive_complement_beta_function",
                     "adaptive_complement_beta_final",
                     "adaptive_complement_decay_steps",
                     "adaptive_complement_decay_start",
@@ -7019,34 +5907,8 @@ def construct_wssr_warm_svd_right_update_param_fn(
             / jnp.maximum(unconstrained_update_norm, 1e-12),
         )
         if optimizer_config.constrain_norm:
-            if norm_constraint_mode == "function_space":
-                (
-                    updates,
-                    function_update_norm,
-                    constraint_scale,
-                    constrained_function_update_norm,
-                ) = constrain_update_function_norm(
-                    log_psi_apply,
-                    params,
-                    position,
-                    updates,
-                    function_norm_constraint,
-                )
-            else:
-                updates = constrain_update_tree_norm(
-                    updates, optimizer_config.norm_constraint
-                )
-        euclidean_safety_scale = jnp.asarray(1.0, dtype=energy.dtype)
-        if euclidean_safety_constraint > 0.0:
-            before_safety_norm = optax.global_norm(updates)
             updates = constrain_update_tree_norm(
-                updates, euclidean_safety_constraint
-            )
-            after_safety_norm = optax.global_norm(updates)
-            euclidean_safety_scale = jnp.where(
-                before_safety_norm > 0.0,
-                after_safety_norm / before_safety_norm,
-                1.0,
+                updates, optimizer_config.norm_constraint
             )
         actual_update_norm = optax.global_norm(updates)
         params = optax.apply_updates(params, updates)
@@ -7080,33 +5942,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                 "eta_g": eta_g_used,
             }
         )
-        if (
-            norm_constraint_mode == "function_space"
-            and optimizer_config.constrain_norm
-        ):
-            metrics.update(
-                {
-                    "wssr_function_update_norm_unconstrained": (
-                        function_update_norm
-                    ),
-                    "wssr_function_update_norm_constrained": (
-                        constrained_function_update_norm
-                    ),
-                    "wssr_function_norm_constraint_scale": constraint_scale,
-                    "wssr_function_norm_constraint_active": (
-                        constraint_scale < 1.0
-                    ).astype(function_update_norm.dtype),
-                }
-            )
-        if euclidean_safety_constraint > 0.0:
-            metrics.update(
-                {
-                    "wssr_euclidean_safety_scale": euclidean_safety_scale,
-                    "wssr_euclidean_safety_active": (
-                        euclidean_safety_scale < 1.0
-                    ).astype(energy.dtype),
-                }
-            )
         if adaptive_S_average:
             metrics.update(
                 {
@@ -7129,55 +5964,6 @@ def construct_wssr_warm_svd_right_update_param_fn(
                 {
                     "gradient_norm": gradient_norm,
                     "gradient_history_norm": gradient_history_norm,
-                }
-            )
-        if reduced_metric_diagnostics is not None:
-            metrics.update(
-                {
-                    "wssr_spectral_history_eta_mean": (
-                        reduced_metric_diagnostics.eta_mean
-                    ),
-                    "wssr_spectral_history_eta_head": (
-                        reduced_metric_diagnostics.eta_head
-                    ),
-                    "wssr_spectral_history_eta_tail": (
-                        reduced_metric_diagnostics.eta_tail
-                    ),
-                    "wssr_spectral_history_noise_floor": (
-                        reduced_metric_diagnostics.noise_floor
-                    ),
-                    "wssr_spectral_history_overlap": (
-                        reduced_metric_diagnostics.history_overlap
-                    ),
-                    "wssr_spectral_history_cluster_count": (
-                        reduced_metric_diagnostics.cluster_count
-                    ),
-                    "wssr_spectral_history_drift_ratio_mean": (
-                        reduced_metric_diagnostics.drift_ratio_mean
-                    ),
-                }
-            )
-        if anisotropic_matrix_diagnostics is not None:
-            metrics.update(
-                {
-                    "wssr_anisotropic_matrix_eta_mean": (
-                        anisotropic_matrix_diagnostics.eta_mean
-                    ),
-                    "wssr_anisotropic_matrix_eta_head": (
-                        anisotropic_matrix_diagnostics.eta_head
-                    ),
-                    "wssr_anisotropic_matrix_eta_tail": (
-                        anisotropic_matrix_diagnostics.eta_tail
-                    ),
-                    "wssr_anisotropic_matrix_eta_spectral_mean": (
-                        anisotropic_matrix_diagnostics.eta_spectral_mean
-                    ),
-                    "wssr_anisotropic_matrix_current_weight": (
-                        anisotropic_matrix_diagnostics.current_weight
-                    ),
-                    "wssr_anisotropic_matrix_noise_floor": (
-                        anisotropic_matrix_diagnostics.noise_floor
-                    ),
                 }
             )
         if solution_recurrence_mode != "none":
@@ -7857,19 +6643,11 @@ def initialize_wssr_warm_svd_right(
         "enable_gradient_transport", False
     )
     eta_S, eta_g = resolve_wssr_averaging_weights(optimizer_config)
-    use_reduced_metric_history = optimizer_config.get(
-        "reduced_metric_history_mode", "none"
-    ) != "none"
-    use_anisotropic_matrix_history = optimizer_config.get(
-        "anisotropic_matrix_history", False
-    )
     use_independent_gradient_memory = (
         optimizer_config.get("adaptive_S_average", False)
         or optimizer_config.get("adaptive_g_average", False)
         or enable_gradient_transport
         or eta_S != eta_g
-    ) and not (
-        use_reduced_metric_history or use_anisotropic_matrix_history
     )
     use_cluster_envelope = optimizer_config.get(
         "experimental_mode", "none"
@@ -7879,7 +6657,6 @@ def initialize_wssr_warm_svd_right(
         "cluster_envelope_ritz_ef",
         "cluster_envelope_ritz_selected",
         "cluster_envelope_ritz_snr",
-        "grassmann_ritz",
     )
     use_cluster_envelope_ef = (
         optimizer_config.get("experimental_mode", "none")

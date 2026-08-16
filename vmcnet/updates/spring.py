@@ -23,7 +23,6 @@ from vmcnet.utils.typing import UpdateDataFn, GetPositionFromData, LearningRateS
 
 from .update_param_fns import (
     UpdateParamFn,
-    constrain_update_function_norm,
     make_traced_fn_with_single_metrics,
     update_metrics_with_noclip,
 )
@@ -174,19 +173,6 @@ def initialize_spring(
     apply_pmap: bool = True,
 ) -> Tuple[UpdateParamFn[P, D, optax.OptState], optax.OptState]:
     """Get an update param function and initial state for SPRING."""
-    norm_constraint_mode = optimizer_config.get(
-        "norm_constraint_mode", "euclidean"
-    )
-    if norm_constraint_mode not in ("euclidean", "function_space"):
-        raise ValueError(
-            "spring norm_constraint_mode must be euclidean or function_space"
-        )
-    function_norm_constraint = optimizer_config.get(
-        "function_norm_constraint", 0.001
-    )
-    if function_norm_constraint <= 0.0:
-        raise ValueError("function_norm_constraint must be positive")
-
     spring_step = get_spring_step(
         log_psi_apply,
         optimizer_config.damping,
@@ -234,40 +220,10 @@ def initialize_spring(
         updates = updates_unconstrained
 
         if optimizer_config.constrain_norm:
-            if norm_constraint_mode == "function_space":
-                (
-                    updates,
-                    function_update_norm,
-                    function_constraint_scale,
-                    constrained_function_update_norm,
-                ) = constrain_update_function_norm(
-                    log_psi_apply,
-                    params,
-                    positions,
-                    updates,
-                    function_norm_constraint,
-                )
-                diagnostics.update(
-                    {
-                        "spring_function_update_norm_unconstrained": (
-                            function_update_norm
-                        ),
-                        "spring_function_update_norm_constrained": (
-                            constrained_function_update_norm
-                        ),
-                        "spring_function_norm_constraint_scale": (
-                            function_constraint_scale
-                        ),
-                        "spring_function_norm_constraint_active": (
-                            function_constraint_scale < 1.0
-                        ).astype(function_update_norm.dtype),
-                    }
-                )
-            else:
-                updates = constrain_norm(
-                    updates,
-                    optimizer_config.norm_constraint,
-                )
+            updates = constrain_norm(
+                updates,
+                optimizer_config.norm_constraint,
+            )
 
         new_params = optax.apply_updates(params, updates)
         if diagnostics_enabled:

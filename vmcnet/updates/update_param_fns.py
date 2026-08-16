@@ -3,7 +3,6 @@
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import jax
-import jax.numpy as jnp
 
 import vmcnet.physics as physics
 import vmcnet.utils as utils
@@ -15,7 +14,6 @@ from vmcnet.utils.typing import (
     D,
     GetPositionFromData,
     LocalEnergyApply,
-    ModelApply,
     OptimizerState,
     P,
     PRNGKey,
@@ -24,45 +22,6 @@ from vmcnet.utils.typing import (
 )
 
 UpdateParamFn = Callable[[P, D, S, PRNGKey], Tuple[P, D, S, Dict, PRNGKey]]
-
-
-def constrain_update_function_norm(
-    log_psi_apply: ModelApply[P],
-    params: P,
-    positions: Array,
-    updates: P,
-    function_norm_constraint: float,
-    eps: float = 1e-12,
-) -> Tuple[P, Array, Array, Array]:
-    """Bound the centered wavefunction tangent induced by an update.
-
-    The function-space norm is ``||O_bar update||_2``, where the score rows
-    are centered over the current walkers and scaled by ``1 / sqrt(N)``.  It
-    is evaluated matrix-free with one JVP; no Fisher/SR matrix is formed.
-
-    Returns the constrained update, its unconstrained function norm, the
-    applied scalar scale, and its constrained function norm.
-    """
-
-    def log_psi_samples(sample_params):
-        return jax.vmap(log_psi_apply, in_axes=(None, 0))(
-            sample_params, positions
-        )
-
-    _, tangent = jax.jvp(log_psi_samples, (params,), (updates,))
-    centered_tangent = tangent - jnp.mean(tangent)
-    score_action = centered_tangent / jnp.sqrt(positions.shape[0])
-    function_norm = jnp.linalg.norm(score_action)
-    radius = jnp.asarray(function_norm_constraint, dtype=function_norm.dtype)
-    scale = jnp.where(
-        function_norm > eps,
-        jnp.minimum(1.0, radius / function_norm),
-        1.0,
-    )
-    constrained_updates = jax.tree_util.tree_map(
-        lambda update: update * scale, updates
-    )
-    return constrained_updates, function_norm, scale, function_norm * scale
 
 
 def make_traced_fn_with_single_metrics(

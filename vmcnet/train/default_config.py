@@ -289,11 +289,6 @@ def get_default_vmc_config() -> Dict:
                 "damping": 0.001,
                 "constrain_norm": True,
                 "norm_constraint": 0.001,
-                # Default preserves the paper's Euclidean update constraint.
-                # In function_space mode, the direct radius below bounds
-                # ||O_bar delta_theta||_2 on the current walker batch.
-                "norm_constraint_mode": "euclidean",
-                "function_norm_constraint": 0.001,
                 # Disabled-by-default per-step state/scale diagnostics.
                 "diagnostics": False,
                 "diagnostics_spectral": False,
@@ -366,10 +361,6 @@ def get_default_vmc_config() -> Dict:
                 "tikhonov_lambda": -1.0,
                 "constrain_norm": True,
                 "norm_constraint": 0.001,
-                # Optional matrix-free function-space constraint. Disabled
-                # by default so existing WSSR configurations are unchanged.
-                "norm_constraint_mode": "euclidean",
-                "function_norm_constraint": 0.001,
                 "eta": 0.99,
                 # Independent averaging weights. Negative values inherit the
                 # legacy shared eta, preserving old configurations exactly.
@@ -377,20 +368,6 @@ def get_default_vmc_config() -> Dict:
                 # the current gradient (eta_g=0) instead.
                 "eta_S": -1.0,
                 "eta_g": -1.0,
-                # Default-disabled alternative to augmented-factor averaging.
-                # SSI determines U from the current batch only; history is
-                # projected into U and averages either the diagonal spectrum
-                # or near-degenerate reduced-metric blocks. The RHS remains
-                # the current gradient (eta_g must be zero when enabled).
-                "reduced_metric_history_mode": "none",
-                "spectral_history_cluster_gap": 0.01,
-                "spectral_history_noise_scale": 1.0,
-                "spectral_history_drift_scale": 1.0,
-                # Pure suggestion-1 ablation: retain legacy augmented-factor
-                # matrix/subspace averaging but replace scalar eta_S by a
-                # spectral-position weight on each stored history mode.
-                "anisotropic_matrix_history": False,
-                "anisotropic_matrix_history_noise_scale": 1.0,
                 # Optional adaptive S-history schedule. New settings take
                 # priority over eta/eta_S only when explicitly enabled.
                 "adaptive_S_average": False,
@@ -513,17 +490,12 @@ def get_default_vmc_config() -> Dict:
                 # complete enclosing subspace instead of replacing its
                 # anisotropic curvature by one mean eigenvalue.
                 "cluster_envelope_curvature_mode": "scalar",
-                # Used only by the default-disabled ``grassmann_ritz`` mode.
-                "grassmann_smoothing_alpha": 0.5,
                 # Default-disabled cross-half-batch empirical shrinkage for
                 # the current-batch Ritz solve. Near-degenerate Ritz modes
                 # share one SNR weight, avoiding basis-dependent filtering.
                 "cluster_snr_gap_threshold": 0.05,
                 "near_tail_modes": 0,
                 "adaptive_complement_beta": 0.0,
-                # Optional current-batch Fisher-metric cap on the same
-                # complement. Zero preserves the legacy Euclidean-only cap.
-                "adaptive_complement_beta_function": 0.0,
                 # Optional continuation-local linear beta decay. A nonpositive
                 # number of steps disables it exactly.
                 "adaptive_complement_beta_final": 0.0,
@@ -544,9 +516,6 @@ def get_default_vmc_config() -> Dict:
                 # c_i=((s_i^2+lambda)c_i^native+gamma<u_i,d_prev>)/
                 #     (s_i^2+lambda+gamma).
                 "native_proximal_gamma": 0.0,
-                # Optional Euclidean backstop applied after the selected
-                # global norm constraint. A negative value disables it.
-                "euclidean_safety_constraint": -1.0,
             },
             "wssr_warm_svd_right_matfree": {
                 # Learning rate settings
